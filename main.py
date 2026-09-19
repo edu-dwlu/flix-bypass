@@ -96,7 +96,7 @@ NICK_BOT        = "@Nick_Bypass_Bot"
 # Group 3 — Alex Bypass Bot (DM mode) — races against the Alex HTTP API
 ALEX_BOT        = "@alexbypassbot"
 
-DEVELOPER       = "@Felix_bhai"
+DEVELOPER       = "Mrr Unknown"
 PORT            = int(os.environ.get('PORT', 5000))
 SECRET_KEY      = (
     os.environ.get("SECRET_KEY")
