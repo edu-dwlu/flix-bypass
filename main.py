@@ -3116,12 +3116,12 @@ def osint_bridge():
         data = request.get_json(silent=True) or {}
         command = (data.get('command') or '').strip()
 
-    command_name, command_error = _osint_command_parts(command)
-    if command_error:
+    command_name, command_value = _osint_command_parts(command)
+    if command_name is None:
         return jsonify({
             "status": False,
             "developer": DEVELOPER,
-            "message": command_error,
+            "message": command_value,
         }), 400
 
     acc_id, acc_state = get_next_osint_active()
