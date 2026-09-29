@@ -123,6 +123,24 @@ ALEX_RACE_MAX_TIMEOUT_SEC = max(
 MAX_BYPASS_TIMEOUT_SEC = max(
     30.0, float(os.environ.get("MAX_BYPASS_TIMEOUT_SEC", "120"))
 )
+
+# ===== FELIX OSINT ADDITIVE PATCH =====
+# OSINT bridge is intentionally separate from the existing bypass state.
+# It uses the same Telethon accounts, but its own round-robin pointer so the
+# existing bypass round_robin_idx and selection logic are not changed.
+OSINT_ENABLED = os.environ.get("OSINT_ENABLED", "0").lower() in ("1", "true", "yes", "on")
+OSINT_GROUP = int(os.environ.get("OSINT_GROUP", "-1003622891965"))
+OSINT_TIMEOUT_SEC = max(5.0, float(os.environ.get("OSINT_TIMEOUT_SEC", "45")))
+OSINT_API_KEY = os.environ.get("OSINT_API_KEY", "").strip()
+OSINT_SERVICE_USER_ID = os.environ.get("OSINT_SERVICE_USER_ID", "").strip()
+OSINT_ALLOWED_COMMANDS = {
+    x.strip().lower().lstrip("/")
+    for x in os.environ.get("OSINT_ALLOWED_COMMANDS", "num,tg").split(",")
+    if x.strip()
+}
+_osint_round_robin_idx = 0
+_osint_rr_lock = threading.Lock()
+
 TRACE_BOTS = os.environ.get("TRACE_BOTS", "0").lower() in ("1", "true", "yes", "on")
 
 def _trace(label, message):
@@ -347,6 +365,15 @@ def _make_acc_dict(acc_id, name, api_id, api_hash, session_string):
         "nick_dm_lock":   threading.Lock(),
         "alex_dm_queue":  [],   # FIFO queue for Alex bot DM requests
         "alex_dm_lock":   threading.Lock(),
+
+
+        # OSINT group state — additive; existing bypass state is untouched.
+        "osint_queue":     [],
+        "osint_lock":      threading.Lock(),
+        "osint_count":     0,
+        "osint_success_count": 0,
+        "osint_fail_count":    0,
+        "last_osint_used": None,
         "username":       None,
         "first_name":     None,
     }
@@ -613,6 +640,172 @@ def _parse_block(block, ent_urls, sent_link):
     if direct_dl:     out["direct"]       = _flatten(direct_dl)
     return out
 
+
+
+
+# ===== FELIX OSINT ADDITIVE PATCH: response parser =====
+_OSINT_REPORT_RE = re.compile(r"REPORT\s*:\s*([^\n{]+)", re.I)
+_OSINT_TARGET_RE = re.compile(r"TARGET\s*:\s*([^\s\n]+)", re.I)
+
+
+def parse_osint_group_message(text):
+    """Parse the group's TARGET/REPORT + JSON response without rewriting JSON."""
+    if not text:
+        return None
+
+    report_match = _OSINT_REPORT_RE.search(text)
+    if not report_match:
+        return None
+
+    report_name = report_match.group(1).strip(" `*:_-") or "OSINT"
+    target_match = _OSINT_TARGET_RE.search(text[:report_match.start()])
+    if target_match is None:
+        target_match = _OSINT_TARGET_RE.search(text)
+    target = target_match.group(1).strip() if target_match else None
+
+    json_start = text.find("{", report_match.end())
+    if json_start < 0:
+        return {
+            "status": "parse_error",
+            "report": report_name,
+            "target": target,
+            "error": "OSINT response did not contain a JSON object",
+            "raw": text[:3000],
+        }
+
+    try:
+        data, _ = json.JSONDecoder().raw_decode(text[json_start:])
+    except Exception as exc:
+        return {
+            "status": "parse_error",
+            "report": report_name,
+            "target": target,
+            "error": f"Invalid JSON from OSINT group: {exc}",
+            "raw": text[:3000],
+        }
+
+    return {
+        "status": "ok",
+        "report": report_name,
+        "target": target,
+        "data": data,
+        "raw": text[:3000],
+    }
+
+
+def _osint_command_parts(command):
+    """Validate an allowlisted OSINT command and return (name, args)."""
+    command = (command or "").strip()
+    if not command.startswith("/"):
+        return None, "Command must start with /"
+    if len(command) > 512:
+        return None, "Command is too long"
+
+    m = re.fullmatch(r"/([A-Za-z0-9_]+)(?:\s+(.+))?", command)
+    if not m:
+        return None, "Invalid command format"
+
+    name = m.group(1).lower()
+    args = (m.group(2) or "").strip()
+    if name not in OSINT_ALLOWED_COMMANDS:
+        return None, f"Command /{name} is not allowed"
+
+    # Keep group traffic bounded and reject control characters.
+    if any(ord(ch) < 32 and ch not in "\t" for ch in command):
+        return None, "Control characters are not allowed"
+
+    # Known commands get basic argument validation; other allowlisted
+    # commands remain available without changing the existing bypass code.
+    if name == "num":
+        if not re.fullmatch(r"\d{10}", args):
+            return None, "/num requires exactly 10 digits"
+    elif name == "tg":
+        if not re.fullmatch(r"[@A-Za-z0-9_.-]{1,128}", args):
+            return None, "/tg requires a Telegram username or numeric/chat ID"
+
+    return name, args
+
+
+
+# ===== FELIX OSINT ADDITIVE PATCH: Telegram group handler =====
+def make_osint_handler(acc_id):
+    async def on_osint_message(event):
+        if not OSINT_ENABLED:
+            return
+
+        with accounts_lock:
+            state = accounts.get(acc_id)
+        if not state:
+            return
+
+        # In production, set OSINT_SERVICE_USER_ID to the exact responder's
+        # Telegram numeric ID. When unset, report-shaped group messages are
+        # accepted so the bridge can be deployed before that ID is known.
+        if OSINT_SERVICE_USER_ID:
+            try:
+                if event.sender_id != int(OSINT_SERVICE_USER_ID):
+                    return
+            except (TypeError, ValueError):
+                return
+
+        msg = event.message
+        text = (msg.text or msg.caption or "").strip()
+        if not text:
+            return
+
+        parsed = parse_osint_group_message(text)
+        if not parsed:
+            return
+
+        reply_to = getattr(getattr(msg, "reply_to", None), "reply_to_msg_id", None)
+        incoming_id = getattr(msg, "id", None)
+
+        with accounts_lock:
+            queue = state.get("osint_queue", [])
+            pending = state.get("pending", {})
+
+        if not queue:
+            return
+
+        # Prefer exact reply-to correlation. Otherwise the OSINT endpoint
+        # serializes requests per account, so queue[0] is the current request.
+        req_id = None
+        if reply_to:
+            for candidate in queue:
+                req = pending.get(candidate)
+                if req and req.get("osint_sent_id") == reply_to:
+                    req_id = candidate
+                    break
+
+        if req_id is None:
+            req_id = queue[0]
+
+        req = pending.get(req_id)
+        if not req or req.get("done"):
+            return
+
+        sent_id = req.get("osint_sent_id")
+        if sent_id and incoming_id and incoming_id <= sent_id:
+            return
+
+        # For numeric /num requests, require an exact TARGET match unless the
+        # group message explicitly replies to our command message.
+        expected_target = req.get("osint_expected_target")
+        expected_command = req.get("osint_command_name")
+        if expected_command == "num" and expected_target:
+            if parsed.get("target") != expected_target and reply_to != sent_id:
+                return
+
+        req["last_osint_ts"] = time.time()
+        req["osint_result"] = parsed
+        _trace(
+            "OSINT",
+            f"matched account={acc_id} req={req_id} report={parsed.get('report')} "
+            f"target={parsed.get('target')} status={parsed.get('status')}",
+        )
+        req["osint_event"].set()
+
+    return on_osint_message
 
 # ==================== PER-ACCOUNT TELEGRAM CLIENT ====================
 def make_dzhq_handler(acc_id):
@@ -1049,6 +1242,14 @@ async def _run_account(acc_id):
         tg.add_event_handler(dzhq_h, events.NewMessage(chats=DZHQ_GROUP))
         tg.add_event_handler(dzhq_h, events.MessageEdited(chats=DZHQ_GROUP))
 
+        # OSINT group listener — additive; existing DZHQ/Nick/Alex listeners
+        # and their conditions remain unchanged.
+        if OSINT_ENABLED:
+            osint_h = make_osint_handler(acc_id)
+            tg.add_event_handler(osint_h, events.NewMessage(chats=OSINT_GROUP))
+            tg.add_event_handler(osint_h, events.MessageEdited(chats=OSINT_GROUP))
+
+
         # Alex bot DM handler — Alex EDITS the progress message into the result,
         # so MessageEdited must be handled as well.
         alex_h = make_alex_dm_handler(acc_id)
@@ -1146,6 +1347,25 @@ def get_next_active():
     with rr_lock:
         idx = round_robin_idx % len(active)
         round_robin_idx = (round_robin_idx + 1) % len(active)
+    return active[idx]
+
+
+
+# ===== FELIX OSINT ADDITIVE PATCH: account selector =====
+def get_next_osint_active():
+    """Round-robin over active accounts using an OSINT-only pointer.
+
+    This deliberately does NOT touch the existing round_robin_idx used by
+    /bypass, so adding OSINT traffic cannot change bypass account order.
+    """
+    global _osint_round_robin_idx
+    with accounts_lock:
+        active = [(k, v) for k, v in accounts.items() if v.get("status") == "active"]
+    if not active:
+        return None, None
+    with _osint_rr_lock:
+        idx = _osint_round_robin_idx % len(active)
+        _osint_round_robin_idx = (_osint_round_robin_idx + 1) % len(active)
     return active[idx]
 
 
@@ -2856,6 +3076,176 @@ def bypass(link_override=None):
     return jsonify(resp)
 
 
+
+
+
+# ==================== OSINT ROUTE — ADDITIVE ONLY ====================
+@app.route('/osint', methods=['GET', 'POST'])
+def osint_bridge():
+    """Forward an allowlisted OSINT command to the configured Telegram group.
+
+    This route is intentionally separate from /bypass. It has its own account
+    round-robin pointer, so OSINT requests do not alter bypass routing order.
+    The endpoint requires an API key and does not persist OSINT responses.
+    """
+    if not OSINT_ENABLED:
+        return jsonify({
+            "status": False,
+            "developer": DEVELOPER,
+            "message": "OSINT service is disabled",
+        }), 503
+
+    if not OSINT_API_KEY:
+        return jsonify({
+            "status": False,
+            "developer": DEVELOPER,
+            "message": "OSINT_API_KEY is not configured",
+        }), 503
+
+    supplied_key = (request.headers.get("X-API-Key") or "").strip()
+    if not supplied_key or not secrets.compare_digest(supplied_key, OSINT_API_KEY):
+        return jsonify({
+            "status": False,
+            "developer": DEVELOPER,
+            "message": "Unauthorized",
+        }), 401
+
+    if request.method == 'GET':
+        command = (request.args.get('command') or '').strip()
+    else:
+        data = request.get_json(silent=True) or {}
+        command = (data.get('command') or '').strip()
+
+    command_name, command_error = _osint_command_parts(command)
+    if command_error:
+        return jsonify({
+            "status": False,
+            "developer": DEVELOPER,
+            "message": command_error,
+        }), 400
+
+    acc_id, acc_state = get_next_osint_active()
+    if not acc_state:
+        return jsonify({
+            "status": False,
+            "developer": DEVELOPER,
+            "message": "No active Telegram account is available for OSINT",
+        }), 503
+
+    osint_lock = acc_state.get("osint_lock")
+    if osint_lock is None:
+        return jsonify({
+            "status": False,
+            "developer": DEVELOPER,
+            "message": "Selected account is missing OSINT lock state",
+        }), 500
+
+    # One in-flight OSINT query per Telethon account prevents FIFO ambiguity.
+    if not osint_lock.acquire(timeout=1.0):
+        return jsonify({
+            "status": False,
+            "developer": DEVELOPER,
+            "message": "Selected Telegram account is busy with another OSINT request",
+        }), 429
+
+    t0 = time.time()
+    req_id = secrets.token_hex(8)
+    loop = acc_state.get("loop")
+    target_arg = (command.split(None, 1)[1].strip() if len(command.split(None, 1)) == 2 else "")
+
+    req = {
+        "link": command,
+        "ts": t0,
+        "done": False,
+        "osint_command_name": command_name,
+        "osint_expected_target": target_arg if command_name == "num" else None,
+        "osint_sent_id": None,
+        "last_osint_ts": None,
+        "osint_event": threading.Event(),
+        "osint_result": None,
+    }
+
+    try:
+        with accounts_lock:
+            accounts[acc_id]["pending"][req_id] = req
+            accounts[acc_id].setdefault("osint_queue", []).append(req_id)
+
+        if not loop or not acc_state.get("client"):
+            return jsonify({
+                "status": False,
+                "developer": DEVELOPER,
+                "message": "Telegram account is not ready",
+            }), 503
+
+        async def _send_osint():
+            sent = await acc_state["client"].send_message(OSINT_GROUP, command)
+            req["osint_sent_id"] = getattr(sent, "id", None)
+            req["last_osint_ts"] = time.time()
+
+        try:
+            asyncio.run_coroutine_threadsafe(_send_osint(), loop).result(timeout=12)
+        except Exception as exc:
+            with accounts_lock:
+                accounts[acc_id]["osint_fail_count"] += 1
+                accounts[acc_id]["last_osint_used"] = datetime.now(timezone.utc).isoformat()
+            return jsonify({
+                "status": False,
+                "developer": DEVELOPER,
+                "message": f"Failed to send OSINT command: {exc}",
+            }), 502
+
+        event = req["osint_event"]
+        if not event.wait(timeout=OSINT_TIMEOUT_SEC):
+            with accounts_lock:
+                accounts[acc_id]["osint_fail_count"] += 1
+                accounts[acc_id]["last_osint_used"] = datetime.now(timezone.utc).isoformat()
+            return jsonify({
+                "status": False,
+                "developer": DEVELOPER,
+                "message": "OSINT responder timed out",
+                "response_ms": f"{int((time.time() - t0) * 1000)}ms",
+            }), 504
+
+        result = req.get("osint_result") or {}
+        ms = int((time.time() - t0) * 1000)
+        with accounts_lock:
+            accounts[acc_id]["osint_count"] += 1
+            accounts[acc_id]["last_osint_used"] = datetime.now(timezone.utc).isoformat()
+            if result.get("status") == "ok":
+                accounts[acc_id]["osint_success_count"] += 1
+            else:
+                accounts[acc_id]["osint_fail_count"] += 1
+
+        if result.get("status") != "ok":
+            return jsonify({
+                "status": False,
+                "developer": DEVELOPER,
+                "response_ms": f"{ms}ms",
+                "source": "osint_group",
+                "report": result.get("report"),
+                "target": result.get("target"),
+                "message": result.get("error") or "Could not parse OSINT response",
+                "raw": result.get("raw", "")[:3000],
+            }), 502
+
+        return jsonify({
+            "status": True,
+            "developer": DEVELOPER,
+            "response_ms": f"{ms}ms",
+            "source": "osint_group",
+            "report": result.get("report"),
+            "target": result.get("target"),
+            "data": result.get("data"),
+            "account": acc_state.get("name", acc_id),
+        })
+    finally:
+        req["done"] = True
+        with accounts_lock:
+            accounts.get(acc_id, {}).get("pending", {}).pop(req_id, None) if accounts.get(acc_id) else None
+            q = accounts.get(acc_id, {}).get("osint_queue", []) if accounts.get(acc_id) else []
+            if req_id in q:
+                q.remove(req_id)
+        osint_lock.release()
 
 # ==================== FLASK SERVER ====================
 def run_flask():
