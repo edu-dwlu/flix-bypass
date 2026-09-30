@@ -778,7 +778,7 @@ def make_osint_handler(acc_id):
                     break
 
         if req_id is None:
-            req_id = queue[0]
+            return
 
         req = pending.get(req_id)
         if not req or req.get("done"):
@@ -788,13 +788,40 @@ def make_osint_handler(acc_id):
         if sent_id and incoming_id and incoming_id <= sent_id:
             return
 
-        # For numeric /num requests, require an exact TARGET match unless the
-        # group message explicitly replies to our command message.
-        expected_target = req.get("osint_expected_target")
-        expected_command = req.get("osint_command_name")
-        if expected_command == "num" and expected_target:
-            if parsed.get("target") != expected_target and reply_to != sent_id:
-                return
+        expected_target = _normalize_osint_target(req.get("osint_expected_target"))
+        expected_command = (req.get("osint_command_name") or "").lower()
+        received_target = _normalize_osint_target(parsed.get("target"))
+
+        report_norm = re.sub(
+            r"[^a-z0-9]+",
+            "",
+            str(parsed.get("report") or "").lower(),
+        )
+
+        expected_reports = {
+            "num": {"numinfo", "numberinfo"},
+            "tg": {"tginfo", "telegraminfo"},
+        }
+
+        allowed_reports = expected_reports.get(expected_command)
+        if not allowed_reports:
+            return
+
+        report_ok = report_norm in allowed_reports
+        reply_ok = bool(reply_to and sent_id and reply_to == sent_id)
+        target_ok = bool(
+            expected_target
+            and received_target
+            and expected_target == received_target
+        )
+
+        # Exact reply is the strongest correlation.
+        # Without a reply, require both correct report type and exact target.
+        if not report_ok:
+            return
+
+        if not reply_ok and not target_ok:
+            return
 
         req["last_osint_ts"] = time.time()
         req["osint_result"] = parsed
