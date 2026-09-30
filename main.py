@@ -138,6 +138,320 @@ OSINT_ALLOWED_COMMANDS = {
     for x in os.environ.get("OSINT_ALLOWED_COMMANDS", "num,tg").split(",")
     if x.strip()
 }
+
+# Multiple OSINT groups (same commands work in every group). Comma-separated
+# group IDs, e.g. OSINT_GROUPS="-100111,-100222". OSINT_GROUP remains the
+# default (first) group for backward compatibility.
+def _parse_osint_groups():
+    groups = []
+    for x in os.environ.get("OSINT_GROUPS", "").split(","):
+        x = x.strip()
+        if not x:
+            continue
+        try:
+            groups.append(int(x))
+        except ValueError:
+            print(f"⚠️ Ignoring invalid OSINT_GROUPS entry: {x!r}")
+    return groups or [OSINT_GROUP]
+
+OSINT_GROUPS = _parse_osint_groups()
+
+# Fixed per-command routing, e.g. OSINT_COMMAND_GROUPS="num:-100111,tg:-100222".
+# Values accept a full group ID or a 1-based index into OSINT_GROUPS
+# ("num:1,tg:2"). Commands without a mapping use the first group.
+def _parse_osint_command_groups():
+    mapping = {}
+    for part in os.environ.get("OSINT_COMMAND_GROUPS", "").split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        cmd, _, val = part.partition(":")
+        cmd, val = cmd.strip().lower().lstrip("/"), val.strip()
+        if cmd and val:
+            mapping[cmd] = val
+    return mapping
+
+OSINT_COMMAND_GROUPS = _parse_osint_command_groups()
+
+# Backend-level default when the caller passes only {"command": ...} with no
+# mode/group — i.e. the frontend never needs to know about routing.
+# "single": fixed per-command group (OSINT_COMMAND_GROUPS, else first group).
+# "race":   fan out to all OSINT_GROUPS, first reply wins.
+OSINT_DEFAULT_MODE = os.environ.get("OSINT_DEFAULT_MODE", "single").strip().lower()
+if OSINT_DEFAULT_MODE not in ("single", "race"):
+    print(f"⚠️ Invalid OSINT_DEFAULT_MODE {OSINT_DEFAULT_MODE!r}; using 'single'")
+    OSINT_DEFAULT_MODE = "single"
+
+
+def _resolve_osint_group(value):
+    """Resolve a group selector (full ID or 1-based index) to a group ID."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        gid = int(float(s)) if "." in s else int(s)
+    except (TypeError, ValueError):
+        return None
+    if gid in OSINT_GROUPS:
+        return gid
+    if 1 <= gid <= len(OSINT_GROUPS):
+        return OSINT_GROUPS[gid - 1]
+    return None
+
+
+def _default_osint_group(command_name):
+    """Fixed per-command group, else the first configured group."""
+    mapped = OSINT_COMMAND_GROUPS.get((command_name or "").lower())
+    resolved = _resolve_osint_group(mapped) if mapped else None
+    return resolved if resolved is not None else OSINT_GROUPS[0]
+
+
+def _osint_group_queue(acc_state, group):
+    """Per (account, group) FIFO queue — replies must never cross groups."""
+    return acc_state.setdefault("osint_group_queues", {}).setdefault(group, [])
+
+
+def _osint_group_lock(acc_state, group):
+    """Per (account, group) in-flight lock."""
+    locks = acc_state.setdefault("osint_group_locks", {})
+    lock = locks.get(group)
+    if lock is None:
+        lock = locks[group] = threading.Lock()
+    return lock
+
+
+# ===== FELIX OSINT ADMIN ROUTING =====
+# Routing (race vs fixed group, per command) is managed from the /admin panel
+# and persisted to disk, so API callers only ever pass {"command": "..."}.
+# Env vars below are first-run bootstrap defaults only.
+OSINT_SETTINGS_FILE = os.environ.get(
+    "OSINT_SETTINGS_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "osint_settings.json"),
+)
+
+osint_settings = {
+    "default_mode": OSINT_DEFAULT_MODE,  # single | race
+    "command_modes": {},    # {"tg": "race"} — per-command mode override
+    "command_groups": {},   # {"num": [-100111]} — per-command group list override
+    "disabled_commands": [],  # allowlisted commands rejected with 403
+    "timeout_sec": None,    # global override, None = OSINT_TIMEOUT_SEC env
+    "command_timeouts": {},  # {"num": 60} — per-command timeout override
+}
+_osint_settings_lock = threading.Lock()
+
+
+def _osint_settings_snapshot():
+    """Thread-safe copy of the routing config plus UI metadata."""
+    with _osint_settings_lock:
+        cfg = {
+            "default_mode": osint_settings["default_mode"],
+            "command_modes": dict(osint_settings["command_modes"]),
+            "command_groups": {k: list(v) for k, v in osint_settings["command_groups"].items()},
+            "disabled_commands": list(osint_settings["disabled_commands"]),
+            "timeout_sec": osint_settings["timeout_sec"],
+            "command_timeouts": dict(osint_settings["command_timeouts"]),
+        }
+    cfg["_meta"] = {
+        "groups": list(OSINT_GROUPS),
+        "allowed_commands": sorted(OSINT_ALLOWED_COMMANDS),
+        "env_timeout_sec": OSINT_TIMEOUT_SEC,
+    }
+    return cfg
+
+
+def _save_osint_settings():
+    try:
+        with _osint_settings_lock:
+            payload = {
+                "default_mode": osint_settings["default_mode"],
+                "command_modes": dict(osint_settings["command_modes"]),
+                "command_groups": {k: list(v) for k, v in osint_settings["command_groups"].items()},
+                "disabled_commands": list(osint_settings["disabled_commands"]),
+                "timeout_sec": osint_settings["timeout_sec"],
+                "command_timeouts": dict(osint_settings["command_timeouts"]),
+            }
+        tmp = OSINT_SETTINGS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp, OSINT_SETTINGS_FILE)
+    except Exception as e:
+        print(f"⚠️ Could not save OSINT settings: {e}")
+
+
+def _load_osint_settings():
+    """File (admin panel) overrides the env bootstrap. Runs once at startup."""
+    # Seed per-command fixed groups from the env map (first-run convenience).
+    with _osint_settings_lock:
+        for cmd, val in OSINT_COMMAND_GROUPS.items():
+            g = _resolve_osint_group(val)
+            if g is not None:
+                osint_settings["command_groups"].setdefault(cmd, [g])
+    if not os.path.exists(OSINT_SETTINGS_FILE):
+        return
+    try:
+        with open(OSINT_SETTINGS_FILE, "r") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("settings root must be an object")
+        ok, err = _validate_osint_settings(data, partial=True)
+        if not ok:
+            print(f"⚠️ Ignoring invalid {OSINT_SETTINGS_FILE}: {err}")
+            return
+        with _osint_settings_lock:
+            if "default_mode" in data:
+                osint_settings["default_mode"] = data["default_mode"]
+            if "command_modes" in data:
+                osint_settings["command_modes"] = data["command_modes"]
+            if "command_groups" in data:
+                osint_settings["command_groups"] = {k: list(v) for k, v in data["command_groups"].items()}
+            if "disabled_commands" in data:
+                osint_settings["disabled_commands"] = list(data["disabled_commands"])
+            if "timeout_sec" in data:
+                osint_settings["timeout_sec"] = data["timeout_sec"]
+            if "command_timeouts" in data:
+                osint_settings["command_timeouts"] = data["command_timeouts"]
+        print(f"💾 Loaded OSINT routing from {OSINT_SETTINGS_FILE}")
+    except Exception as e:
+        print(f"⚠️ Could not load OSINT settings: {e}")
+
+
+def _validate_osint_settings(data, partial=False):
+    """Validate an admin settings payload. Returns (ok, error)."""
+    if not isinstance(data, dict):
+        return False, "Body must be a JSON object"
+    allowed_keys = {"default_mode", "command_modes", "command_groups",
+                    "disabled_commands", "timeout_sec", "command_timeouts"}
+    for k in data:
+        if k not in allowed_keys:
+            return False, f"Unknown key: {k}"
+    with _osint_settings_lock:
+        current = {
+            "default_mode": osint_settings["default_mode"],
+            "command_modes": dict(osint_settings["command_modes"]),
+            "command_groups": {k: list(v) for k, v in osint_settings["command_groups"].items()},
+        }
+    merged = dict(current)
+    if "default_mode" in data:
+        if data["default_mode"] not in ("single", "race"):
+            return False, "default_mode must be 'single' or 'race'"
+        merged["default_mode"] = data["default_mode"]
+    if "command_modes" in data:
+        if not isinstance(data["command_modes"], dict):
+            return False, "command_modes must be an object"
+        for cmd, m in data["command_modes"].items():
+            if m not in ("single", "race"):
+                return False, f"command_modes[{cmd}] must be 'single' or 'race'"
+        merged["command_modes"] = {str(k).strip().lower().lstrip("/"): v for k, v in data["command_modes"].items()}
+    if "command_groups" in data:
+        if not isinstance(data["command_groups"], dict):
+            return False, "command_groups must be an object"
+        cleaned = {}
+        for cmd, groups in data["command_groups"].items():
+            if not isinstance(groups, list) or not groups:
+                return False, f"command_groups[{cmd}] must be a non-empty array of group IDs"
+            seen, out = set(), []
+            for g in groups:
+                try:
+                    gid = int(g)
+                except (TypeError, ValueError):
+                    return False, f"command_groups[{cmd}] has invalid group ID: {g!r}"
+                if gid not in OSINT_GROUPS:
+                    return False, f"command_groups[{cmd}]: group {gid} is not in OSINT_GROUPS"
+                if gid not in seen:
+                    seen.add(gid)
+                    out.append(gid)
+            cleaned[str(cmd).strip().lower().lstrip("/")] = out
+        merged["command_groups"] = cleaned
+    if "disabled_commands" in data:
+        if not isinstance(data["disabled_commands"], list):
+            return False, "disabled_commands must be an array"
+        data["disabled_commands"] = [str(x).strip().lower().lstrip("/") for x in data["disabled_commands"] if str(x).strip()]
+    if "timeout_sec" in data:
+        if data["timeout_sec"] is not None:
+            try:
+                t = float(data["timeout_sec"])
+            except (TypeError, ValueError):
+                return False, "timeout_sec must be a number or null"
+            if t < 5:
+                return False, "timeout_sec must be >= 5"
+            data["timeout_sec"] = t
+    if "command_timeouts" in data:
+        if not isinstance(data["command_timeouts"], dict):
+            return False, "command_timeouts must be an object"
+        cleaned = {}
+        for cmd, t in data["command_timeouts"].items():
+            try:
+                t = float(t)
+            except (TypeError, ValueError):
+                return False, f"command_timeouts[{cmd}] must be a number"
+            if t < 5:
+                return False, f"command_timeouts[{cmd}] must be >= 5"
+            cleaned[str(cmd).strip().lower().lstrip("/")] = t
+        data["command_timeouts"] = cleaned
+    # Cross-check: single mode with several groups is ambiguous — reject it.
+    probed = set(OSINT_ALLOWED_COMMANDS) | set(merged["command_modes"]) | set(merged["command_groups"])
+    for cmd in probed:
+        eff_mode = merged["command_modes"].get(cmd, merged["default_mode"])
+        eff_groups = merged["command_groups"].get(cmd)
+        if eff_mode == "single" and eff_groups and len(eff_groups) > 1:
+            return False, f"/{cmd}: single mode with {len(eff_groups)} groups is ambiguous — use race or one group"
+    return True, ""
+
+
+def _resolve_osint_routing(command_name, group_param="", mode_param=""):
+    """Resolve (target_groups, mode, error, http_status).
+
+    Priority: explicit request params > admin panel config > env defaults,
+    so plain {"command": "..."} calls are fully admin-driven.
+    """
+    with _osint_settings_lock:
+        cfg_modes = dict(osint_settings["command_modes"])
+        cfg_groups = {k: list(v) for k, v in osint_settings["command_groups"].items()}
+        cfg_default = osint_settings["default_mode"]
+        cfg_disabled = set(osint_settings["disabled_commands"])
+    if command_name in cfg_disabled:
+        return None, None, f"Command /{command_name} is disabled by admin", 403
+    if group_param:
+        wanted = [g for g in (_resolve_osint_group(x) for x in str(group_param).split(",")) if g is not None]
+        if not wanted:
+            return None, None, f"Unknown OSINT group: {group_param}", 400
+        mode = (mode_param or "").strip().lower() or cfg_modes.get(command_name) or cfg_default
+        if mode not in ("single", "race"):
+            return None, None, "Invalid mode: use 'single' or 'race'", 400
+        if mode == "single" and len(wanted) > 1:
+            return None, None, "Single mode accepts exactly one group; use mode=race for several", 400
+        return wanted, mode, "", 200
+    mode = (mode_param or "").strip().lower() or cfg_modes.get(command_name) or cfg_default
+    if mode not in ("single", "race"):
+        return None, None, "Invalid mode: use 'single' or 'race'", 400
+    groups = [g for g in cfg_groups.get(command_name, []) if g in OSINT_GROUPS]
+    if cfg_groups.get(command_name) and not groups:
+        return None, None, f"No valid OSINT group configured for /{command_name}", 400
+    if groups:
+        return (groups[:1] if mode == "single" else groups), mode, "", 200
+    if mode == "race":
+        return list(OSINT_GROUPS), mode, "", 200
+    return [_default_osint_group(command_name)], mode, "", 200
+
+
+def _osint_timeout_for(command_name):
+    """Effective wait budget: per-command > global admin > env."""
+    with _osint_settings_lock:
+        t = osint_settings["command_timeouts"].get(command_name)
+        if t is None:
+            t = osint_settings["timeout_sec"]
+    if t is None:
+        return OSINT_TIMEOUT_SEC
+    try:
+        return max(5.0, float(t))
+    except (TypeError, ValueError):
+        return OSINT_TIMEOUT_SEC
+
+
+_load_osint_settings()
+
 _osint_round_robin_idx = 0
 _osint_rr_lock = threading.Lock()
 
@@ -370,6 +684,8 @@ def _make_acc_dict(acc_id, name, api_id, api_hash, session_string):
         # OSINT group state — additive; existing bypass state is untouched.
         "osint_queue":     [],
         "osint_lock":      threading.Lock(),
+        "osint_group_queues": {},
+        "osint_group_locks":  {},
         "osint_count":     0,
         "osint_success_count": 0,
         "osint_fail_count":    0,
@@ -782,7 +1098,9 @@ def _osint_command_parts(command):
 
 
 # ===== FELIX OSINT ADDITIVE PATCH: Telegram group handler =====
-def make_osint_handler(acc_id):
+def make_osint_handler(acc_id, group):
+    """Group-aware OSINT listener. One instance is registered per OSINT group;
+    correlation (reply-to + FIFO queue) is scoped to that group only."""
     async def on_osint_message(event):
         if not OSINT_ENABLED:
             return
@@ -816,7 +1134,7 @@ def make_osint_handler(acc_id):
         incoming_id = getattr(msg, "id", None)
 
         with accounts_lock:
-            queue = list(state.get("osint_queue", []))
+            queue = list(_osint_group_queue(state, group))
             pending = state.get("pending", {})
 
         if not queue:
@@ -826,18 +1144,22 @@ def make_osint_handler(acc_id):
         if reply_to:
             # A threaded reply identifies its request exactly. A reply that
             # matches nothing pending belongs to somebody else — ignore it.
+            # In race mode a request has one sent ID per group.
             for candidate in queue:
                 req = pending.get(candidate)
-                if req and not req.get("done") and req.get("osint_sent_id") == reply_to:
+                if not req or req.get("done"):
+                    continue
+                sent_ids = req.get("osint_sent_ids") or {}
+                if req.get("osint_sent_id") == reply_to or reply_to in sent_ids.values():
                     req_id = candidate
                     break
             if req_id is None:
-                _trace("OSINT", f"ignored account={acc_id} reply_to={reply_to} (no pending request)")
+                _trace("OSINT", f"ignored account={acc_id} group={group} reply_to={reply_to} (no pending request)")
                 return
         else:
             # Broadcast-style response (no reply header): attribute it to the
-            # oldest unfinished request. The OSINT endpoint serializes one
-            # in-flight query per account, so queue[0] is the current request.
+            # oldest unfinished request in THIS group. The OSINT endpoint
+            # serializes one in-flight query per (account, group).
             for candidate in queue:
                 req = pending.get(candidate)
                 if req and not req.get("done"):
@@ -876,7 +1198,8 @@ def make_osint_handler(acc_id):
         )
         report_ok = bool(report_norm) and report_norm in allowed_reports
         report_is_other = bool(report_norm) and report_norm in other_reports
-        reply_ok = bool(reply_to and sent_id and reply_to == sent_id)
+        sent_ids = req.get("osint_sent_ids") or {}
+        reply_ok = bool(reply_to and (reply_to == sent_id or reply_to in sent_ids.values()))
         target_ok = _osint_targets_equal(expected_target, received_target)
 
         # Exact reply is the strongest correlation — accept it whatever the
@@ -901,7 +1224,7 @@ def make_osint_handler(acc_id):
         if not accept:
             _trace(
                 "OSINT",
-                f"ignored account={acc_id} reason={reason} reply_to={reply_to} "
+                f"ignored account={acc_id} group={group} reason={reason} reply_to={reply_to} "
                 f"sent={sent_id} report={parsed.get('report')} target={parsed.get('target')} "
                 f"expected={req.get('osint_expected_target')}",
             )
@@ -909,9 +1232,10 @@ def make_osint_handler(acc_id):
 
         req["last_osint_ts"] = time.time()
         req["osint_result"] = parsed
+        req["osint_winning_group"] = group
         _trace(
             "OSINT",
-            f"matched account={acc_id} req={req_id} via={reason} report={parsed.get('report')} "
+            f"matched account={acc_id} group={group} req={req_id} via={reason} report={parsed.get('report')} "
             f"target={parsed.get('target')} status={parsed.get('status')}",
         )
         req["osint_event"].set()
@@ -1356,9 +1680,10 @@ async def _run_account(acc_id):
         # OSINT group listener — additive; existing DZHQ/Nick/Alex listeners
         # and their conditions remain unchanged.
         if OSINT_ENABLED:
-            osint_h = make_osint_handler(acc_id)
-            tg.add_event_handler(osint_h, events.NewMessage(chats=OSINT_GROUP))
-            tg.add_event_handler(osint_h, events.MessageEdited(chats=OSINT_GROUP))
+            for _osint_group in OSINT_GROUPS:
+                osint_h = make_osint_handler(acc_id, _osint_group)
+                tg.add_event_handler(osint_h, events.NewMessage(chats=_osint_group))
+                tg.add_event_handler(osint_h, events.MessageEdited(chats=_osint_group))
 
 
         # Alex bot DM handler — Alex EDITS the progress message into the result,
@@ -1765,6 +2090,11 @@ ADMIN_HTML = r"""<!DOCTYPE html>
   .field label { display:block; font-size:.72rem; color:var(--muted); font-family:'JetBrains Mono',monospace; text-transform:uppercase; letter-spacing:.1em; margin-bottom:.4rem; }
   .field input, .field textarea { width:100%; background:rgba(0,0,0,.4); border:1px solid rgba(255,255,255,.1); border-radius:.625rem; padding:.65rem .875rem; color:var(--text); font-family:'JetBrains Mono',monospace; font-size:.8rem; outline:none; transition:border-color .2s; resize:vertical; }
   .field input:focus, .field textarea:focus { border-color:var(--violet); box-shadow:0 0 0 2px rgba(139,92,246,.15); }
+  select { background:rgba(0,0,0,.4); border:1px solid rgba(255,255,255,.1); border-radius:.5rem; padding:.45rem .6rem; color:var(--text); font-family:'JetBrains Mono',monospace; font-size:.78rem; outline:none; }
+  select:focus { border-color:var(--violet); }
+  option { background:#111; }
+  .osint-chip { display:inline-flex; align-items:center; gap:.3rem; padding:.3rem .6rem; margin:.15rem; border-radius:.5rem; background:rgba(0,0,0,.3); border:1px solid rgba(255,255,255,.12); font-size:.72rem; font-family:'JetBrains Mono',monospace; cursor:pointer; white-space:nowrap; }
+  .osint-chip input { accent-color:var(--green); }
   .field-row { display:grid; grid-template-columns:1fr 1fr; gap:.75rem; }
   .section-header { display:flex; align-items:center; justify-content:space-between; margin-bottom:1rem; flex-wrap:wrap; gap:.75rem; }
   .actions-bar { display:flex; gap:.5rem; flex-wrap:wrap; }
@@ -1816,6 +2146,7 @@ ADMIN_HTML = r"""<!DOCTYPE html>
       <button class="nav-item active" onclick="showPage('dashboard')" id="nav-dashboard"><span class="nav-icon">📊</span><span>Dashboard</span></button>
       <button class="nav-item" onclick="showPage('accounts')" id="nav-accounts"><span class="nav-icon">👤</span><span>Accounts</span></button>
       <button class="nav-item" onclick="showPage('bots')" id="nav-bots"><span class="nav-icon">⚡</span><span>Bots</span></button>
+      <button class="nav-item" onclick="showPage('osint')" id="nav-osint"><span class="nav-icon">🛰️</span><span>OSINT</span></button>
     </div>
     <div class="sidebar-footer">
       <button class="btn-logout" onclick="logout()"><span class="nav-icon">🚪</span><span>Logout</span></button>
@@ -2036,6 +2367,43 @@ ADMIN_HTML = r"""<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- OSINT Routing -->
+    <div class="page" id="page-osint">
+      <div class="page-header">
+        <div class="page-title">OSINT Routing</div>
+        <div class="page-sub">PER-COMMAND GROUP + MODE CONTROL — API STAYS COMMAND-ONLY</div>
+      </div>
+      <div class="glass" style="padding:1.5rem;margin-bottom:1rem;">
+        <div style="font-weight:700;font-size:.9rem;margin-bottom:1rem;">🌍 Global Defaults</div>
+        <div class="field-row">
+          <div class="field"><label>Default Mode</label>
+            <select id="osintDefaultMode">
+              <option value="single">Single — fixed group per command</option>
+              <option value="race">Race — all groups, first reply wins</option>
+            </select>
+          </div>
+          <div class="field"><label>Timeout Override (sec, blank = env)</label>
+            <input type="number" id="osintTimeout" min="5" step="1" placeholder="e.g. 55">
+          </div>
+        </div>
+        <div class="text-xs text-muted text-mono" id="osintGroupsLine"></div>
+      </div>
+      <div class="glass" style="padding:1.5rem;">
+        <div class="section-header">
+          <div style="font-weight:700;font-size:.9rem;">📡 Per-Command Rules</div>
+          <div class="actions-bar">
+            <button class="btn btn-green" onclick="saveOsintSettings()">💾 Save Routing</button>
+            <button class="btn btn-amber" onclick="resetOsintSettings()">↺ Reset</button>
+          </div>
+        </div>
+        <div class="text-xs text-muted text-mono" style="margin-bottom:.75rem;">MODE = INHERIT FOLLOWS GLOBAL DEFAULT · NO GROUP TICKED = INHERIT · BLANK TIMEOUT = INHERIT</div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Command</th><th>Enabled</th><th>Mode</th><th>Groups</th><th>Timeout</th></tr></thead>
+          <tbody id="osintTable"><tr><td colspan="5" class="empty-state">Loading...</td></tr></tbody>
+        </table></div>
+      </div>
+    </div>
+
   </main>
 </div>
 
@@ -2136,6 +2504,7 @@ function showApp() {
   document.getElementById('mainApp').classList.add('visible');
   startRefresh();
   loadBotsStatus();
+  loadOsintSettings();
 }
 
 function logout() {
@@ -2347,6 +2716,84 @@ async function toggleBot(bot, enabled) {
     toast(`${labels[bot] || bot} ${enabled ? 'enabled' : 'disabled'}`, 'success');
   } catch(e) { toast(e.message, 'error'); loadBotsStatus(); }
 }
+
+let osintCfg = null;
+async function loadOsintSettings() {
+  try {
+    const d = await apiCall('GET', '/admin/api/osint/settings');
+    if (!d.success) return;
+    osintCfg = d.settings;
+    renderOsintSettings(d.settings);
+  } catch(e) {}
+}
+
+function renderOsintSettings(s) {
+  const meta = s._meta || {};
+  document.getElementById('osintDefaultMode').value = s.default_mode || 'single';
+  document.getElementById('osintTimeout').value = (s.timeout_sec == null ? '' : s.timeout_sec);
+  document.getElementById('osintGroupsLine').textContent =
+    'GROUPS: ' + (meta.groups || []).join('  ·  ') + '    |    TIMEOUT ENV: ' + (meta.env_timeout_sec || '?') + 's';
+  const cmds = meta.allowed_commands || [];
+  const tb = document.getElementById('osintTable');
+  tb.innerHTML = cmds.map(cmd => {
+    const cm = (s.command_modes || {})[cmd];
+    const cg = (s.command_groups || {})[cmd] || [];
+    const ct = (s.command_timeouts || {})[cmd];
+    const en = !(s.disabled_commands || []).includes(cmd);
+    const chips = (meta.groups || []).map(g =>
+      `<label class="osint-chip"><input type="checkbox" data-osint-cmd="${cmd}" data-osint-group="${g}" ${cg.includes(g) ? 'checked' : ''}> ${g}</label>`
+    ).join('');
+    return `<tr>
+      <td class="text-mono" style="font-weight:700;">/${cmd}</td>
+      <td><label class="toggle-switch"><input type="checkbox" data-osint-enabled="${cmd}" ${en ? 'checked' : ''}><span class="toggle-slider"></span></label></td>
+      <td><select data-osint-mode="${cmd}">
+        <option value="" ${!cm ? 'selected' : ''}>Inherit (${s.default_mode})</option>
+        <option value="single" ${cm === 'single' ? 'selected' : ''}>Single</option>
+        <option value="race" ${cm === 'race' ? 'selected' : ''}>Race</option>
+      </select></td>
+      <td>${chips || '<span class="text-muted text-xs">no groups</span>'}</td>
+      <td><input type="number" min="5" step="1" placeholder="inherit" style="width:90px;background:rgba(0,0,0,.4);border:1px solid rgba(255,255,255,.1);border-radius:.5rem;padding:.4rem .6rem;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:.78rem;" data-osint-timeout="${cmd}" value="${ct == null ? '' : ct}"></td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="5" class="empty-state">No commands allowlisted</td></tr>';
+}
+
+async function saveOsintSettings() {
+  try {
+    const tVal = document.getElementById('osintTimeout').value;
+    const body = {
+      default_mode: document.getElementById('osintDefaultMode').value,
+      timeout_sec: tVal === '' ? null : parseFloat(tVal),
+      command_modes: {}, command_groups: {}, command_timeouts: {}, disabled_commands: []
+    };
+    document.querySelectorAll('[data-osint-mode]').forEach(el => {
+      if (el.value) body.command_modes[el.dataset.osintMode] = el.value;
+    });
+    document.querySelectorAll('[data-osint-timeout]').forEach(el => {
+      if (el.value !== '') body.command_timeouts[el.dataset.osintTimeout] = parseFloat(el.value);
+    });
+    document.querySelectorAll('[data-osint-enabled]').forEach(el => {
+      if (!el.checked) body.disabled_commands.push(el.dataset.osintEnabled);
+    });
+    const grouped = {};
+    document.querySelectorAll('[data-osint-group]').forEach(el => {
+      if (el.checked) (grouped[el.dataset.osintCmd] = grouped[el.dataset.osintCmd] || []).push(parseInt(el.dataset.osintGroup));
+    });
+    body.command_groups = grouped;
+    const d = await apiCall('POST', '/admin/api/osint/settings', body);
+    if (!d.success) { toast(d.error || 'Save failed', 'error'); return; }
+    renderOsintSettings(d.settings);
+    toast('OSINT routing saved', 'success');
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+async function resetOsintSettings() {
+  try {
+    const d = await apiCall('POST', '/admin/api/osint/settings/reset');
+    if (!d.success) { toast('Reset failed', 'error'); return; }
+    renderOsintSettings(d.settings);
+    toast('OSINT routing reset to defaults', 'success');
+  } catch(e) { toast(e.message, 'error'); }
+}
 </script>
 </body>
 </html>"""
@@ -2543,6 +2990,53 @@ def admin_bots_toggle():
                         "error": "Cannot disable both bots — keep at least one enabled"}), 400
     bot_settings[bot] = enab
     return jsonify(_bots_state({"success": True, "bot": bot, "enabled": enab}))
+
+
+# ==================== ADMIN OSINT ROUTING API — ADDITIVE ONLY ====================
+@app.route('/admin/api/osint/settings', methods=['GET'])
+@require_auth
+def admin_osint_settings():
+    return jsonify({"success": True, "settings": _osint_settings_snapshot()})
+
+@app.route('/admin/api/osint/settings', methods=['POST'])
+@require_auth
+def admin_osint_save():
+    d = request.get_json(silent=True) or {}
+    ok, err = _validate_osint_settings(d, partial=True)
+    if not ok:
+        return jsonify({"success": False, "error": err}), 400
+    with _osint_settings_lock:
+        if "default_mode" in d:
+            osint_settings["default_mode"] = d["default_mode"]
+        if "command_modes" in d:
+            osint_settings["command_modes"] = {str(k).strip().lower().lstrip("/"): v for k, v in d["command_modes"].items()}
+        if "command_groups" in d:
+            osint_settings["command_groups"] = {str(k).strip().lower().lstrip("/"): [int(g) for g in v] for k, v in d["command_groups"].items()}
+        if "disabled_commands" in d:
+            osint_settings["disabled_commands"] = list(d["disabled_commands"])
+        if "timeout_sec" in d:
+            osint_settings["timeout_sec"] = d["timeout_sec"]
+        if "command_timeouts" in d:
+            osint_settings["command_timeouts"] = {str(k).strip().lower().lstrip("/"): v for k, v in d["command_timeouts"].items()}
+    _save_osint_settings()
+    return jsonify({"success": True, "settings": _osint_settings_snapshot()})
+
+@app.route('/admin/api/osint/settings/reset', methods=['POST'])
+@require_auth
+def admin_osint_reset():
+    with _osint_settings_lock:
+        osint_settings["default_mode"] = OSINT_DEFAULT_MODE
+        osint_settings["command_modes"] = {}
+        osint_settings["command_groups"] = {}
+        for cmd, val in OSINT_COMMAND_GROUPS.items():
+            g = _resolve_osint_group(val)
+            if g is not None:
+                osint_settings["command_groups"][cmd] = [g]
+        osint_settings["disabled_commands"] = []
+        osint_settings["timeout_sec"] = None
+        osint_settings["command_timeouts"] = {}
+    _save_osint_settings()
+    return jsonify({"success": True, "settings": _osint_settings_snapshot()})
 
 
 # ==================== PUBLIC HOME / STATUS ====================
@@ -3193,11 +3687,20 @@ def bypass(link_override=None):
 # ==================== OSINT ROUTE — ADDITIVE ONLY ====================
 @app.route('/osint', methods=['GET', 'POST'])
 def osint_bridge():
-    """Forward an allowlisted OSINT command to the configured Telegram group.
+    """Forward an allowlisted OSINT command to the configured Telegram group(s).
 
     This route is intentionally separate from /bypass. It has its own account
     round-robin pointer, so OSINT requests do not alter bypass routing order.
     The endpoint requires an API key and does not persist OSINT responses.
+
+    Params (GET query or POST JSON):
+      command: e.g. "/num 9876543210" (required, except for service info).
+      group:   full group ID ("-100...") or 1-based index into OSINT_GROUPS;
+               comma-separated list allowed in race mode. Default: fixed
+               per-command group from OSINT_COMMAND_GROUPS, else first group.
+      mode:    "single" or "race" (send to all/selected groups, first
+               reply wins). Optional override — routing defaults to the
+               /admin panel config, so callers may pass only {"command"}.
     """
     if not OSINT_ENABLED:
         return jsonify({
@@ -3223,9 +3726,32 @@ def osint_bridge():
 
     if request.method == 'GET':
         command = (request.args.get('command') or '').strip()
+        group_param = (request.args.get('group') or '').strip()
+        mode_param = (request.args.get('mode') or '').strip().lower()
     else:
         data = request.get_json(silent=True) or {}
         command = (data.get('command') or '').strip()
+        group_param = str(data.get('group') or '').strip()
+        mode_param = str(data.get('mode') or '').strip().lower()
+
+    # No command -> service info for frontends (groups / commands / routing).
+    if not command:
+        return jsonify({
+            "status": True,
+            "developer": DEVELOPER,
+            "service": "osint",
+            "groups": OSINT_GROUPS,
+            "allowed_commands": sorted(OSINT_ALLOWED_COMMANDS),
+            "routing": _osint_settings_snapshot(),
+            "effective": {
+                cmd: {"mode": m, "groups": g}
+                for cmd, (g, m, _, _) in (
+                    (c, _resolve_osint_routing(c)) for c in sorted(OSINT_ALLOWED_COMMANDS)
+                )
+            },
+            "modes": ["single", "race"],
+            "timeout_sec": OSINT_TIMEOUT_SEC,
+        })
 
     command_name, command_value = _osint_command_parts(command)
     if command_name is None:
@@ -3235,6 +3761,19 @@ def osint_bridge():
             "message": command_value,
         }), 400
 
+    # Routing is admin-managed (/admin panel); explicit request params only
+    # override it when provided, so plain {"command": "..."} just works.
+    target_groups, mode, route_err, route_status = _resolve_osint_routing(
+        command_name, group_param, mode_param)
+    if route_err:
+        return jsonify({
+            "status": False,
+            "developer": DEVELOPER,
+            "message": route_err,
+            "mode": mode,
+            "groups": OSINT_GROUPS,
+        }), route_status
+
     acc_id, acc_state = get_next_osint_active()
     if not acc_state:
         return jsonify({
@@ -3243,21 +3782,22 @@ def osint_bridge():
             "message": "No active Telegram account is available for OSINT",
         }), 503
 
-    osint_lock = acc_state.get("osint_lock")
-    if osint_lock is None:
-        return jsonify({
-            "status": False,
-            "developer": DEVELOPER,
-            "message": "Selected account is missing OSINT lock state",
-        }), 500
+    # One in-flight OSINT query per (account, group) prevents FIFO ambiguity.
+    # Locks are collected under accounts_lock, then acquired without holding it.
+    with accounts_lock:
+        group_locks = [(g, _osint_group_lock(accounts[acc_id], g)) for g in sorted(set(target_groups))]
 
-    # One in-flight OSINT query per Telethon account prevents FIFO ambiguity.
-    if not osint_lock.acquire(timeout=1.0):
-        return jsonify({
-            "status": False,
-            "developer": DEVELOPER,
-            "message": "Selected Telegram account is busy with another OSINT request",
-        }), 429
+    held_locks = []
+    for g, lk in group_locks:
+        if not lk.acquire(timeout=1.0):
+            for _, h in held_locks:
+                h.release()
+            return jsonify({
+                "status": False,
+                "developer": DEVELOPER,
+                "message": f"Selected Telegram account is busy with another OSINT request (group {g})",
+            }), 429
+        held_locks.append((g, lk))
 
     t0 = time.time()
     req_id = secrets.token_hex(8)
@@ -3270,7 +3810,11 @@ def osint_bridge():
         "done": False,
         "osint_command_name": command_name,
         "osint_expected_target": target_arg,
+        "osint_groups": [g for g, _ in group_locks],
+        "osint_mode": mode,
         "osint_sent_id": None,
+        "osint_sent_ids": {},
+        "osint_winning_group": None,
         "last_osint_ts": None,
         "osint_event": threading.Event(),
         "osint_result": None,
@@ -3279,7 +3823,8 @@ def osint_bridge():
     try:
         with accounts_lock:
             accounts[acc_id]["pending"][req_id] = req
-            accounts[acc_id].setdefault("osint_queue", []).append(req_id)
+            for g, _ in group_locks:
+                _osint_group_queue(accounts[acc_id], g).append(req_id)
 
         if not loop or not acc_state.get("client"):
             return jsonify({
@@ -3289,8 +3834,11 @@ def osint_bridge():
             }), 503
 
         async def _send_osint():
-            sent = await acc_state["client"].send_message(OSINT_GROUP, command)
-            req["osint_sent_id"] = getattr(sent, "id", None)
+            for g, _ in group_locks:
+                sent = await acc_state["client"].send_message(g, command)
+                req["osint_sent_ids"][g] = getattr(sent, "id", None)
+            ids = list(req["osint_sent_ids"].values())
+            req["osint_sent_id"] = ids[0] if ids else None
             req["last_osint_ts"] = time.time()
 
         try:
@@ -3306,7 +3854,7 @@ def osint_bridge():
             }), 502
 
         event = req["osint_event"]
-        if not event.wait(timeout=OSINT_TIMEOUT_SEC):
+        if not event.wait(timeout=_osint_timeout_for(command_name)):
             with accounts_lock:
                 accounts[acc_id]["osint_fail_count"] += 1
                 accounts[acc_id]["last_osint_used"] = datetime.now(timezone.utc).isoformat()
@@ -3315,6 +3863,8 @@ def osint_bridge():
                 "developer": DEVELOPER,
                 "message": "OSINT responder timed out",
                 "response_ms": f"{int((time.time() - t0) * 1000)}ms",
+                "mode": mode,
+                "groups": req.get("osint_groups"),
             }), 504
 
         result = req.get("osint_result") or {}
@@ -3337,6 +3887,8 @@ def osint_bridge():
                 "target": result.get("target"),
                 "message": result.get("error") or "Could not parse OSINT response",
                 "raw": result.get("raw", "")[:3000],
+                "mode": mode,
+                "group": req.get("osint_winning_group"),
             }), 502
 
         return jsonify({
@@ -3348,15 +3900,23 @@ def osint_bridge():
             "target": result.get("target"),
             "data": result.get("data"),
             "account": acc_state.get("name", acc_id),
+            "mode": mode,
+            "group": req.get("osint_winning_group"),
         })
     finally:
         req["done"] = True
         with accounts_lock:
             accounts.get(acc_id, {}).get("pending", {}).pop(req_id, None) if accounts.get(acc_id) else None
-            q = accounts.get(acc_id, {}).get("osint_queue", []) if accounts.get(acc_id) else []
-            if req_id in q:
-                q.remove(req_id)
-        osint_lock.release()
+            queues = accounts.get(acc_id, {}).get("osint_group_queues", {}) if accounts.get(acc_id) else {}
+            for g in req.get("osint_groups", []):
+                q = queues.get(g, [])
+                if req_id in q:
+                    q.remove(req_id)
+        for _, lk in held_locks:
+            try:
+                lk.release()
+            except Exception:
+                pass
 
 # ==================== FLASK SERVER ====================
 def run_flask():
