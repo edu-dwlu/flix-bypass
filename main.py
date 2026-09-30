@@ -645,31 +645,85 @@ def _parse_block(block, ent_urls, sent_link):
 
 # ===== FELIX OSINT ADDITIVE PATCH: response parser =====
 _OSINT_REPORT_RE = re.compile(r"REPORT\s*:\s*([^\n{]+)", re.I)
-_OSINT_TARGET_RE = re.compile(r"TARGET\s*:\s*([^\s\n]+)", re.I)
+_OSINT_TARGET_RE = re.compile(r"TARGET\s*:\s*([^\n]+)", re.I)
+
+
+def _normalize_osint_target(value):
+    """Normalize a phone number / username / chat ID for comparison.
+
+    Returns None for empty values. Usernames lose a leading @ and case;
+    phone-ish values collapse to digits so "+91 98765 43210" and
+    "98765-43210" compare equal to "919876543210"-style targets.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    s = s.lstrip("@").strip()
+    if re.fullmatch(r"[+\d][\d\s\-().]*", s) and re.sub(r"\D", "", s):
+        return re.sub(r"\D", "", s)
+    return s.lower()
+
+
+def _osint_targets_equal(a, b):
+    """True when two normalized targets refer to the same lookup."""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    # Tolerate a responder that echoes the number with/without country code.
+    if a.isdigit() and b.isdigit() and len(min(a, b, key=len)) >= 7:
+        if a.endswith(b) or b.endswith(a):
+            return True
+    return False
 
 
 def parse_osint_group_message(text):
-    """Parse the group's TARGET/REPORT + JSON response without rewriting JSON."""
-    if not text:
+    """Parse the group's TARGET/REPORT + JSON response without rewriting JSON.
+
+    Tolerant by design: the responder's exact layout may vary, so a message
+    counts as a response when it carries a REPORT line, a TARGET line, or a
+    JSON object. Anything else returns None so group chatter is ignored.
+    """
+    if not text or not text.strip():
         return None
 
     report_match = _OSINT_REPORT_RE.search(text)
-    if not report_match:
-        return None
+    if report_match:
+        report_name = report_match.group(1).strip(" `*:_-") or None
+    else:
+        report_name = None
 
-    report_name = report_match.group(1).strip(" `*:_-") or "OSINT"
-    target_match = _OSINT_TARGET_RE.search(text[:report_match.start()])
+    json_start = text.find("{", report_match.end()) if report_match else -1
+    if json_start < 0:
+        json_start = text.find("{")
+
+    # Prefer the header area (before the JSON payload) for the TARGET line so
+    # a "target"-looking key inside the JSON body cannot confuse matching.
+    head = text[:json_start] if json_start >= 0 else text
+    target_match = _OSINT_TARGET_RE.search(head)
     if target_match is None:
         target_match = _OSINT_TARGET_RE.search(text)
-    target = target_match.group(1).strip() if target_match else None
+    if target_match:
+        # Take the rest of the TARGET line (numbers may contain spaces), but
+        # stop at an inline JSON payload or a same-line REPORT header.
+        target = target_match.group(1).split("{", 1)[0]
+        target = re.split(r"\breport\s*:", target, flags=re.I)[0]
+        target = target.strip(" `@*:_-,.;") or None
+    else:
+        target = None
 
-    json_start = text.find("{", report_match.end())
     if json_start < 0:
+        if not report_match and not target_match:
+            return None
+        # Response-shaped message without a JSON payload: surface the raw
+        # text as data instead of forcing a timeout downstream.
         return {
-            "status": "parse_error",
+            "status": "ok",
             "report": report_name,
             "target": target,
-            "error": "OSINT response did not contain a JSON object",
+            "data": {"text": text.strip()[:4000]},
             "raw": text[:3000],
         }
 
@@ -744,6 +798,7 @@ def make_osint_handler(acc_id):
         if OSINT_SERVICE_USER_ID:
             try:
                 if event.sender_id != int(OSINT_SERVICE_USER_ID):
+                    _trace("OSINT", f"ignored sender={event.sender_id} (not the configured responder)")
                     return
             except (TypeError, ValueError):
                 return
@@ -761,24 +816,35 @@ def make_osint_handler(acc_id):
         incoming_id = getattr(msg, "id", None)
 
         with accounts_lock:
-            queue = state.get("osint_queue", [])
+            queue = list(state.get("osint_queue", []))
             pending = state.get("pending", {})
 
         if not queue:
             return
 
-        # Prefer exact reply-to correlation. Otherwise the OSINT endpoint
-        # serializes requests per account, so queue[0] is the current request.
         req_id = None
         if reply_to:
+            # A threaded reply identifies its request exactly. A reply that
+            # matches nothing pending belongs to somebody else — ignore it.
             for candidate in queue:
                 req = pending.get(candidate)
-                if req and req.get("osint_sent_id") == reply_to:
+                if req and not req.get("done") and req.get("osint_sent_id") == reply_to:
                     req_id = candidate
                     break
-
-        if req_id is None:
-            return
+            if req_id is None:
+                _trace("OSINT", f"ignored account={acc_id} reply_to={reply_to} (no pending request)")
+                return
+        else:
+            # Broadcast-style response (no reply header): attribute it to the
+            # oldest unfinished request. The OSINT endpoint serializes one
+            # in-flight query per account, so queue[0] is the current request.
+            for candidate in queue:
+                req = pending.get(candidate)
+                if req and not req.get("done"):
+                    req_id = candidate
+                    break
+            if req_id is None:
+                return
 
         req = pending.get(req_id)
         if not req or req.get("done"):
@@ -799,35 +865,53 @@ def make_osint_handler(acc_id):
         )
 
         expected_reports = {
-            "num": {"numinfo", "numberinfo"},
-            "tg": {"tginfo", "telegraminfo"},
+            "num": {"num", "numinfo", "numberinfo", "phoneinfo", "mobileinfo",
+                    "truecaller", "callerinfo"},
+            "tg": {"tg", "tginfo", "telegraminfo", "userinfo", "usercheck"},
         }
 
-        allowed_reports = expected_reports.get(expected_command)
-        if not allowed_reports:
-            return
-
-        report_ok = report_norm in allowed_reports
-        reply_ok = bool(reply_to and sent_id and reply_to == sent_id)
-        target_ok = bool(
-            expected_target
-            and received_target
-            and expected_target == received_target
+        allowed_reports = expected_reports.get(expected_command, set())
+        other_reports = set().union(
+            *(names for cmd, names in expected_reports.items() if cmd != expected_command)
         )
+        report_ok = bool(report_norm) and report_norm in allowed_reports
+        report_is_other = bool(report_norm) and report_norm in other_reports
+        reply_ok = bool(reply_to and sent_id and reply_to == sent_id)
+        target_ok = _osint_targets_equal(expected_target, received_target)
 
-        # Exact reply is the strongest correlation.
-        # Without a reply, require both correct report type and exact target.
-        if not report_ok:
-            return
+        # Exact reply is the strongest correlation — accept it whatever the
+        # responder chose to name its report.
+        if reply_ok:
+            accept, reason = True, "reply"
+        elif report_is_other:
+            # Clearly a response to a different command type.
+            accept, reason = False, "other-command-report"
+        elif expected_command == "num":
+            # Numeric lookups must correlate by target (or by a recognized
+            # report type when the responder omits the TARGET line).
+            if expected_target and received_target:
+                accept, reason = (target_ok, "target" if target_ok else "target-mismatch")
+            else:
+                accept, reason = (report_ok, "report" if report_ok else "no-target-no-report")
+        else:
+            # /tg and other allowlisted commands: broadcast responses are
+            # FIFO-attributed unless they are clearly another command's.
+            accept, reason = True, "fifo"
 
-        if not reply_ok and not target_ok:
+        if not accept:
+            _trace(
+                "OSINT",
+                f"ignored account={acc_id} reason={reason} reply_to={reply_to} "
+                f"sent={sent_id} report={parsed.get('report')} target={parsed.get('target')} "
+                f"expected={req.get('osint_expected_target')}",
+            )
             return
 
         req["last_osint_ts"] = time.time()
         req["osint_result"] = parsed
         _trace(
             "OSINT",
-            f"matched account={acc_id} req={req_id} report={parsed.get('report')} "
+            f"matched account={acc_id} req={req_id} via={reason} report={parsed.get('report')} "
             f"target={parsed.get('target')} status={parsed.get('status')}",
         )
         req["osint_event"].set()
@@ -3185,7 +3269,7 @@ def osint_bridge():
         "ts": t0,
         "done": False,
         "osint_command_name": command_name,
-        "osint_expected_target": target_arg if command_name == "num" else None,
+        "osint_expected_target": target_arg,
         "osint_sent_id": None,
         "last_osint_ts": None,
         "osint_event": threading.Event(),
