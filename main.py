@@ -2515,10 +2515,13 @@ function logout() {
 }
 
 function showPage(name) {
+  const pg = document.getElementById('page-'+name);
+  const nv = document.getElementById('nav-'+name);
+  if (!pg || !nv) { toast('Page not found: ' + name, 'error'); return; }
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-  document.getElementById('page-'+name).classList.add('active');
-  document.getElementById('nav-'+name).classList.add('active');
+  pg.classList.add('active');
+  nv.classList.add('active');
 }
 
 function startRefresh() { refresh(); refreshTimer = setInterval(refresh, 5000); }
@@ -2728,13 +2731,18 @@ async function loadOsintSettings() {
 }
 
 function renderOsintSettings(s) {
+  if (!s) return;
   const meta = s._meta || {};
-  document.getElementById('osintDefaultMode').value = s.default_mode || 'single';
-  document.getElementById('osintTimeout').value = (s.timeout_sec == null ? '' : s.timeout_sec);
-  document.getElementById('osintGroupsLine').textContent =
+  const dmEl = document.getElementById('osintDefaultMode');
+  const toEl = document.getElementById('osintTimeout');
+  const glEl = document.getElementById('osintGroupsLine');
+  const tb = document.getElementById('osintTable');
+  if (!dmEl || !toEl || !glEl || !tb) return;
+  dmEl.value = s.default_mode || 'single';
+  toEl.value = (s.timeout_sec == null ? '' : s.timeout_sec);
+  glEl.textContent =
     'GROUPS: ' + (meta.groups || []).join('  ·  ') + '    |    TIMEOUT ENV: ' + (meta.env_timeout_sec || '?') + 's';
   const cmds = meta.allowed_commands || [];
-  const tb = document.getElementById('osintTable');
   tb.innerHTML = cmds.map(cmd => {
     const cm = (s.command_modes || {})[cmd];
     const cg = (s.command_groups || {})[cmd] || [];
