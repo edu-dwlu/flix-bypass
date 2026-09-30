@@ -173,6 +173,28 @@ def _parse_osint_command_groups():
 
 OSINT_COMMAND_GROUPS = _parse_osint_command_groups()
 
+# Per-group responders: "group_id:responder_id" pairs, e.g.
+# OSINT_GROUP_RESPONDERS="-100111:12345,-100222:67890".
+# Each group can have a DIFFERENT responder bot. Groups without an entry fall
+# back to OSINT_SERVICE_USER_ID, then to accepting any sender.
+def _parse_osint_group_responders():
+    mapping = {}
+    for part in os.environ.get("OSINT_GROUP_RESPONDERS", "").split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        gval, _, sval = part.partition(":")
+        try:
+            gid = int(gval.strip())
+            sid = int(sval.strip())
+        except (TypeError, ValueError):
+            print(f"⚠️ Ignoring invalid OSINT_GROUP_RESPONDERS entry: {part!r}")
+            continue
+        mapping[gid] = sid
+    return mapping
+
+OSINT_GROUP_RESPONDERS = _parse_osint_group_responders()
+
 # Backend-level default when the caller passes only {"command": ...} with no
 # mode/group — i.e. the frontend never needs to know about routing.
 # "single": fixed per-command group (OSINT_COMMAND_GROUPS, else first group).
@@ -235,6 +257,7 @@ osint_settings = {
     "default_mode": OSINT_DEFAULT_MODE,  # single | race
     "command_modes": {},    # {"tg": "race"} — per-command mode override
     "command_groups": {},   # {"num": [-100111]} — per-command group list override
+    "group_responders": {},  # {-100111: 12345} — responder numeric ID per group
     "disabled_commands": [],  # allowlisted commands rejected with 403
     "timeout_sec": None,    # global override, None = OSINT_TIMEOUT_SEC env
     "command_timeouts": {},  # {"num": 60} — per-command timeout override
@@ -249,6 +272,7 @@ def _osint_settings_snapshot():
             "default_mode": osint_settings["default_mode"],
             "command_modes": dict(osint_settings["command_modes"]),
             "command_groups": {k: list(v) for k, v in osint_settings["command_groups"].items()},
+            "group_responders": dict(osint_settings["group_responders"]),
             "disabled_commands": list(osint_settings["disabled_commands"]),
             "timeout_sec": osint_settings["timeout_sec"],
             "command_timeouts": dict(osint_settings["command_timeouts"]),
@@ -268,6 +292,7 @@ def _save_osint_settings():
                 "default_mode": osint_settings["default_mode"],
                 "command_modes": dict(osint_settings["command_modes"]),
                 "command_groups": {k: list(v) for k, v in osint_settings["command_groups"].items()},
+                "group_responders": dict(osint_settings["group_responders"]),
                 "disabled_commands": list(osint_settings["disabled_commands"]),
                 "timeout_sec": osint_settings["timeout_sec"],
                 "command_timeouts": dict(osint_settings["command_timeouts"]),
@@ -282,12 +307,14 @@ def _save_osint_settings():
 
 def _load_osint_settings():
     """File (admin panel) overrides the env bootstrap. Runs once at startup."""
-    # Seed per-command fixed groups from the env map (first-run convenience).
+    # Seed per-command fixed groups + per-group responders from env (first-run).
     with _osint_settings_lock:
         for cmd, val in OSINT_COMMAND_GROUPS.items():
             g = _resolve_osint_group(val)
             if g is not None:
                 osint_settings["command_groups"].setdefault(cmd, [g])
+        for gid, sid in OSINT_GROUP_RESPONDERS.items():
+            osint_settings["group_responders"].setdefault(gid, sid)
     if not os.path.exists(OSINT_SETTINGS_FILE):
         return
     try:
@@ -304,6 +331,8 @@ def _load_osint_settings():
                 osint_settings["default_mode"] = data["default_mode"]
             if "command_modes" in data:
                 osint_settings["command_modes"] = data["command_modes"]
+            if "group_responders" in data:
+                osint_settings["group_responders"] = {int(k): int(v) for k, v in data["group_responders"].items()}
             if "command_groups" in data:
                 osint_settings["command_groups"] = {k: list(v) for k, v in data["command_groups"].items()}
             if "disabled_commands" in data:
@@ -322,7 +351,8 @@ def _validate_osint_settings(data, partial=False):
     if not isinstance(data, dict):
         return False, "Body must be a JSON object"
     allowed_keys = {"default_mode", "command_modes", "command_groups",
-                    "disabled_commands", "timeout_sec", "command_timeouts"}
+                    "group_responders", "disabled_commands", "timeout_sec",
+                    "command_timeouts"}
     for k in data:
         if k not in allowed_keys:
             return False, f"Unknown key: {k}"
@@ -364,6 +394,25 @@ def _validate_osint_settings(data, partial=False):
                     out.append(gid)
             cleaned[str(cmd).strip().lower().lstrip("/")] = out
         merged["command_groups"] = cleaned
+    if "group_responders" in data:
+        if not isinstance(data["group_responders"], dict):
+            return False, "group_responders must be an object"
+        cleaned_resp = {}
+        for k, v in data["group_responders"].items():
+            try:
+                gid = int(str(k).strip())
+            except (TypeError, ValueError):
+                return False, f"group_responders has invalid group ID: {k!r}"
+            if gid not in OSINT_GROUPS:
+                return False, f"group_responders: group {gid} is not in OSINT_GROUPS"
+            if v is None or (isinstance(v, str) and not v.strip()):
+                continue  # blank = accept any sender in that group
+            try:
+                sid = int(str(v).strip())
+            except (TypeError, ValueError):
+                return False, f"group_responders[{gid}] has invalid responder ID: {v!r}"
+            cleaned_resp[gid] = sid
+        data["group_responders"] = cleaned_resp
     if "disabled_commands" in data:
         if not isinstance(data["disabled_commands"], list):
             return False, "disabled_commands must be an array"
@@ -448,6 +497,20 @@ def _osint_timeout_for(command_name):
         return max(5.0, float(t))
     except (TypeError, ValueError):
         return OSINT_TIMEOUT_SEC
+
+
+def _osint_responder_for(group):
+    """Responder numeric ID for a group: admin map > global env > None (any)."""
+    with _osint_settings_lock:
+        sid = osint_settings["group_responders"].get(group)
+    if sid is not None:
+        return sid
+    if OSINT_SERVICE_USER_ID:
+        try:
+            return int(OSINT_SERVICE_USER_ID)
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 _load_osint_settings()
@@ -1110,13 +1173,16 @@ def make_osint_handler(acc_id, group):
         if not state:
             return
 
-        # In production, set OSINT_SERVICE_USER_ID to the exact responder's
-        # Telegram numeric ID. When unset, report-shaped group messages are
-        # accepted so the bridge can be deployed before that ID is known.
-        if OSINT_SERVICE_USER_ID:
+        # Per-group responder: each OSINT group may have a DIFFERENT responder
+        # bot (admin panel or OSINT_GROUP_RESPONDERS env). Groups without one
+        # fall back to OSINT_SERVICE_USER_ID, then to accepting any sender.
+        # TIP: with TRACE_BOTS=1 the matched/ignored logs print every sender
+        # ID, so you can discover a responder's numeric ID from the logs.
+        _resp_id = _osint_responder_for(group)
+        if _resp_id is not None:
             try:
-                if event.sender_id != int(OSINT_SERVICE_USER_ID):
-                    _trace("OSINT", f"ignored sender={event.sender_id} (not the configured responder)")
+                if event.sender_id != int(_resp_id):
+                    _trace("OSINT", f"ignored group={group} sender={event.sender_id} (not the configured responder)")
                     return
             except (TypeError, ValueError):
                 return
@@ -1235,8 +1301,8 @@ def make_osint_handler(acc_id, group):
         req["osint_winning_group"] = group
         _trace(
             "OSINT",
-            f"matched account={acc_id} group={group} req={req_id} via={reason} report={parsed.get('report')} "
-            f"target={parsed.get('target')} status={parsed.get('status')}",
+            f"matched account={acc_id} group={group} sender={event.sender_id} req={req_id} via={reason} "
+            f"report={parsed.get('report')} target={parsed.get('target')} status={parsed.get('status')}",
         )
         req["osint_event"].set()
 
@@ -2388,6 +2454,11 @@ ADMIN_HTML = r"""<!DOCTYPE html>
         </div>
         <div class="text-xs text-muted text-mono" id="osintGroupsLine"></div>
       </div>
+      <div class="glass" style="padding:1.5rem;margin-bottom:1rem;">
+        <div style="font-weight:700;font-size:.9rem;margin-bottom:.5rem;">🤖 Group Responders</div>
+        <div class="text-xs text-muted text-mono" style="margin-bottom:.75rem;">NUMERIC TELEGRAM ID OF EACH GROUP'S RESPONDER BOT — GROUPS MAY HAVE DIFFERENT BOTS — BLANK = ACCEPT ANY SENDER</div>
+        <div id="osintResponders"></div>
+      </div>
       <div class="glass" style="padding:1.5rem;">
         <div class="section-header">
           <div style="font-weight:700;font-size:.9rem;">📡 Per-Command Rules</div>
@@ -2737,11 +2808,24 @@ function renderOsintSettings(s) {
   const toEl = document.getElementById('osintTimeout');
   const glEl = document.getElementById('osintGroupsLine');
   const tb = document.getElementById('osintTable');
-  if (!dmEl || !toEl || !glEl || !tb) return;
+  const respBox = document.getElementById('osintResponders');
+  if (!dmEl || !toEl || !glEl || !tb || !respBox) return;
   dmEl.value = s.default_mode || 'single';
   toEl.value = (s.timeout_sec == null ? '' : s.timeout_sec);
   glEl.textContent =
     'GROUPS: ' + (meta.groups || []).join('  ·  ') + '    |    TIMEOUT ENV: ' + (meta.env_timeout_sec || '?') + 's';
+  const resp = s.group_responders || {};
+  respBox.innerHTML = (meta.groups || []).map(g => {
+    const v = resp[g] ?? resp[String(g)] ?? '';
+    return `<div class="field-row" style="margin-bottom:.5rem;align-items:end;">
+      <div class="field" style="margin-bottom:0;"><label>Group</label>
+        <input type="text" value="${g}" disabled style="opacity:.6;">
+      </div>
+      <div class="field" style="margin-bottom:0;"><label>Responder numeric ID (blank = any)</label>
+        <input type="number" data-osint-responder="${g}" value="${v}" placeholder="e.g. 123456789">
+      </div>
+    </div>`;
+  }).join('') || '<div class="empty-state">No groups configured</div>';
   const cmds = meta.allowed_commands || [];
   tb.innerHTML = cmds.map(cmd => {
     const cm = (s.command_modes || {})[cmd];
@@ -2771,8 +2855,11 @@ async function saveOsintSettings() {
     const body = {
       default_mode: document.getElementById('osintDefaultMode').value,
       timeout_sec: tVal === '' ? null : parseFloat(tVal),
-      command_modes: {}, command_groups: {}, command_timeouts: {}, disabled_commands: []
+      command_modes: {}, command_groups: {}, group_responders: {}, command_timeouts: {}, disabled_commands: []
     };
+    document.querySelectorAll('[data-osint-responder]').forEach(el => {
+      if (el.value !== '') body.group_responders[el.dataset.osintResponder] = parseInt(el.value);
+    });
     document.querySelectorAll('[data-osint-mode]').forEach(el => {
       if (el.value) body.command_modes[el.dataset.osintMode] = el.value;
     });
@@ -3020,6 +3107,8 @@ def admin_osint_save():
             osint_settings["command_modes"] = {str(k).strip().lower().lstrip("/"): v for k, v in d["command_modes"].items()}
         if "command_groups" in d:
             osint_settings["command_groups"] = {str(k).strip().lower().lstrip("/"): [int(g) for g in v] for k, v in d["command_groups"].items()}
+        if "group_responders" in d:
+            osint_settings["group_responders"] = {int(k): int(v) for k, v in d["group_responders"].items()}
         if "disabled_commands" in d:
             osint_settings["disabled_commands"] = list(d["disabled_commands"])
         if "timeout_sec" in d:
@@ -3040,6 +3129,7 @@ def admin_osint_reset():
             g = _resolve_osint_group(val)
             if g is not None:
                 osint_settings["command_groups"][cmd] = [g]
+        osint_settings["group_responders"] = dict(OSINT_GROUP_RESPONDERS)
         osint_settings["disabled_commands"] = []
         osint_settings["timeout_sec"] = None
         osint_settings["command_timeouts"] = {}
