@@ -113,6 +113,12 @@ ALEX_BYPASS_API = os.environ.get(
 ALEX_TIMEOUT_SEC = float(os.environ.get("ALEX_TIMEOUT_SEC", "20"))
 ALEX_ALLOWED_HOST_PARTS = ("urlking", "monteolympus")
 ALEX_BOT_TIMEOUT_SEC = float(os.environ.get("ALEX_BOT_TIMEOUT_SEC", "75"))
+# Alex route toggle — alex branch ONLY (DZHQ/Nick never reach the Alex code).
+# race = API + @alexbypassbot compete (default) · bot = bot only, skip the API
+# api = Alex HTTP API only, no Telegram DM is sent.
+ALEX_ROUTE = os.environ.get("ALEX_ROUTE", "race").strip().lower()
+if ALEX_ROUTE not in ("race", "bot", "api"):
+    ALEX_ROUTE = "race"
 # Only silence triggers this timeout. Progress/loading messages refresh it.
 BYPASS_IDLE_TIMEOUT_SEC = float(os.environ.get("BYPASS_IDLE_TIMEOUT_SEC", "30"))
 # A non-positive per-bot timeout must never turn an HTTP request into an
@@ -527,7 +533,8 @@ def _trace(label, message):
 # ── Bot toggle settings ────────────────────────────────────────────────────────
 # Set to False to disable a bot entirely (it won't be sent to or waited on)
 bot_settings        = {"dzhq": True, "nick": True, "dzhq_first": False,
-                       "nick_first": False, "random_mode": False, "alex_bot": True}
+                       "nick_first": False, "random_mode": False, "alex_bot": True,
+                       "alex_route": ALEX_ROUTE}
 
 # ── Random Mode state ──────────────────────────────────────────────────────────
 # Random Mode: ek bot par lagataar N requests (random 3-10), phir doosre bot par
@@ -1877,8 +1884,16 @@ def alex_race(link):
     """
     Race the Alex HTTP API against @alexbypassbot (Telegram DM).
     Whichever answers first wins. Returns (winner_dict|None, error_str|None).
+
+    The alex_route toggle selects which racers run — alex branch ONLY:
+    race (default) = API + bot compete · bot = @alexbypassbot only, the HTTP
+    API is never called · api = HTTP API only, no Telegram DM is ever sent.
     """
-    use_bot = bot_settings.get("alex_bot", True)
+    route = str(bot_settings.get("alex_route", "race")).strip().lower()
+    if route not in ("race", "bot", "api"):
+        route = "race"
+    use_api = route in ("race", "api")
+    use_bot = route in ("race", "bot") and bot_settings.get("alex_bot", True)
 
     race_event  = threading.Event()
     winner      = {}
@@ -1919,7 +1934,7 @@ def alex_race(link):
         else:
             _record_error("api", err)
 
-    threads = [threading.Thread(target=_api_racer, daemon=True)]
+    threads = [threading.Thread(target=_api_racer, daemon=True)] if use_api else []
 
     # ── Racer 2: @alexbypassbot DM ────────────────────────────────────
     acc_id = None
@@ -1929,7 +1944,7 @@ def alex_race(link):
 
     if use_bot:
         acc_id, acc_state = get_next_active()
-        error_goal = 1 + int(bool(acc_state))
+        error_goal = int(use_api) + int(bool(acc_state))
         if acc_state:
             req_id    = secrets.token_hex(8)
             req_entry = {
@@ -1995,6 +2010,16 @@ def alex_race(link):
         else:
             errors['bot'] = "No active Telegram account for Alex bot"
 
+    # No active racer (route=bot with no Telegram account, or the bot switch
+    # is off while the API is skipped) must fail fast instead of sitting
+    # through the whole race budget.
+    if not threads and not winner.get("url"):
+        if route == "bot" and not bot_settings.get("alex_bot", True):
+            errors.setdefault("bot", "Alex DM bot is disabled — enable it in /admin")
+        msg = " | ".join(f"{k}: {v}" for k, v in errors.items() if v) or \
+            f"Alex resolver has no active racer (route={route})"
+        return None, msg
+
     for t in threads:
         t.start()
 
@@ -2029,7 +2054,7 @@ def alex_race(link):
     if winner.get('url'):
         return winner, None
 
-    msg = " | ".join(f"{k}: {v}" for k, v in errors.items() if v) or "Alex API and Alex bot both failed"
+    msg = " | ".join(f"{k}: {v}" for k, v in errors.items() if v) or f"Alex resolver failed (route={route})"
     return None, msg
 
 
@@ -2340,6 +2365,15 @@ ADMIN_HTML = r"""<!DOCTYPE html>
               <input type="checkbox" id="alexBotToggle" onchange="toggleBot('alex_bot', this.checked)">
               <span class="toggle-slider"></span>
             </label>
+          </div>
+          <div style="margin-top:.75rem;">
+            <label style="font-size:.72rem;color:var(--muted);display:block;margin-bottom:.375rem;letter-spacing:.04em;">ROUTE — WHERE SHOULD URLKING / MONTEOLYMPUS LINKS GO?</label>
+            <select id="alexRoute" onchange="setAlexRoute(this.value)" style="width:100%;padding:.625rem .75rem;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.12);border-radius:.5rem;color:var(--text);font-size:.82rem;">
+              <option value="race">⚡ Race — API + @alexbypassbot (fastest wins)</option>
+              <option value="bot">🤖 Bot only — @alexbypassbot (API skipped)</option>
+              <option value="api">🌐 API only — Alex HTTP API (no Telegram DM)</option>
+            </select>
+            <div class="text-xs text-mono" id="alexRouteDesc" style="margin-top:.5rem;color:var(--muted);line-height:1.6;"></div>
           </div>
           <div style="margin-top:.875rem;font-size:.75rem;color:var(--muted);line-height:1.6;">
             On = Alex API aur @alexbypassbot dono ek saath try karte hain — jo pehle jawab de wohi jeetta hai. Off = sirf Alex API.
@@ -2729,6 +2763,9 @@ function _applyBotState(d) {
   }
   if (abEl) abEl.checked = (d.alex_bot !== false);
   if (abLbl) { const on = (d.alex_bot !== false); abLbl.textContent = on ? 'Enabled' : 'Disabled'; abLbl.style.color = on ? 'var(--green)' : 'var(--red)'; }
+  const axRoute = document.getElementById('alexRoute');
+  if (axRoute) axRoute.value = d.alex_route || 'race';
+  updateAlexRouteDesc(d.alex_route || 'race', (d.alex_bot !== false));
 
   if (dLbl)  { dLbl.textContent  = d.dzhq       ? 'Enabled'               : 'Disabled'; dLbl.style.color  = d.dzhq       ? 'var(--green)' : 'var(--red)'; }
   if (nLbl)  { nLbl.textContent  = d.nick       ? 'Enabled'               : 'Disabled'; nLbl.style.color  = d.nick       ? 'var(--green)' : 'var(--red)'; }
@@ -2788,6 +2825,26 @@ async function toggleBot(bot, enabled) {
     _applyBotState(d);
     const labels = { dzhq: 'DZHQ', nick: 'Nick', dzhq_first: 'DZHQ First Mode', nick_first: 'Nick First Mode', random_mode: 'Random Mode', alex_bot: 'Alex DM Bot' };
     toast(`${labels[bot] || bot} ${enabled ? 'enabled' : 'disabled'}`, 'success');
+  } catch(e) { toast(e.message, 'error'); loadBotsStatus(); }
+}
+
+function updateAlexRouteDesc(route, botOn) {
+  const el = document.getElementById('alexRouteDesc');
+  if (!el) return;
+  const desc = {
+    race: botOn ? '⚡ Race active: API + @alexbypassbot compete, fastest wins.' : '⚡ Route=race but the bot switch is OFF → API only.',
+    bot: botOn ? '🤖 Bot only: every Alex link goes to @alexbypassbot, the API is never called.' : '🤖 Route=bot but the bot switch is OFF → resolver disabled.',
+    api: '🌐 API only: every Alex link goes to the Alex HTTP API, no Telegram DM is sent.'
+  };
+  el.textContent = desc[route] || desc.race;
+}
+
+async function setAlexRoute(route) {
+  try {
+    const d = await apiCall('POST', '/admin/api/bots/alex-route', {route});
+    if (!d.success) { toast(d.error || 'Invalid route', 'error'); loadBotsStatus(); return; }
+    _applyBotState(d);
+    toast(`Alex route → ${route}`, 'success');
   } catch(e) { toast(e.message, 'error'); loadBotsStatus(); }
 }
 
@@ -3046,6 +3103,7 @@ def _bots_state(extra=None):
         "nick_first":  bot_settings.get("nick_first", False),
         "random_mode": bot_settings.get("random_mode", False),
         "alex_bot":    bot_settings.get("alex_bot", True),
+        "alex_route":  bot_settings.get("alex_route", "race"),
         "random":      _random_status(),
     }
     if extra:
@@ -3085,6 +3143,17 @@ def admin_bots_toggle():
                         "error": "Cannot disable both bots — keep at least one enabled"}), 400
     bot_settings[bot] = enab
     return jsonify(_bots_state({"success": True, "bot": bot, "enabled": enab}))
+
+@app.route('/admin/api/bots/alex-route', methods=['POST'])
+@require_auth
+def admin_bots_alex_route():
+    """Alex-only route toggle: race (API+bot) | bot (@alexbypassbot only) | api (HTTP API only)."""
+    d = request.get_json(silent=True) or {}
+    route = str(d.get("route", "")).strip().lower()
+    if route not in ("race", "bot", "api"):
+        return jsonify({"success": False, "error": "Invalid route — use race, bot, or api"}), 400
+    bot_settings["alex_route"] = route
+    return jsonify(_bots_state({"success": True, "route": route}))
 
 
 # ==================== ADMIN OSINT ROUTING API — ADDITIVE ONLY ====================
@@ -3163,8 +3232,9 @@ def _public_status():
                            "nick": bot_settings.get("nick", True),
                            "dzhq_first": bot_settings.get("dzhq_first", False),
                            "nick_first": bot_settings.get("nick_first", False),
-                           "random_mode": bot_settings.get("random_mode", False),
-                           "alex_bot": bot_settings.get("alex_bot", True)},
+                            "random_mode": bot_settings.get("random_mode", False),
+                            "alex_bot": bot_settings.get("alex_bot", True),
+                            "alex_route": bot_settings.get("alex_route", "race")},
         "accounts":       accs,
     }
 
