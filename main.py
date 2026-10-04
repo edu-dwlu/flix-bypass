@@ -569,6 +569,135 @@ def _set_exclusive_mode(mode):
     for m in ("dzhq_first", "nick_first", "random_mode"):
         bot_settings[m] = (m == mode)
 
+# ── Bypass priority rules ─────────────────────────────────────────────────
+# Ordered {pattern → target} rules. The first rule whose pattern appears in
+# the link (case-insensitive substring) wins, and that resolver runs
+# STRICTLY — no fallback to the other bots. Example: tipsguru.in → alex_bot
+# sends every tipsguru link to @alexbypassbot, even though tipsguru is not an
+# Alex-branch domain.
+BYPASS_PRIORITY_TARGETS = ("dzhq", "nick", "alex_bot", "alex_api", "alex_race")
+BYPASS_SETTINGS_FILE = os.environ.get("BYPASS_SETTINGS_FILE", "bypass_settings.json")
+_MAX_BYPASS_PRIORITIES = 50
+
+def _parse_bypass_priorities(raw):
+    """Parse BYPASS_PRIORITIES env: 'tipsguru.in:alex_bot,foo.com:nick'."""
+    rules = []
+    seen = set()
+    for item in str(raw or "").split(","):
+        item = item.strip()
+        if not item or ":" not in item:
+            continue
+        pattern, _, target = item.rpartition(":")
+        pattern = pattern.strip()
+        target = target.strip().lower()
+        if not pattern or target not in BYPASS_PRIORITY_TARGETS:
+            print(f"[Priorities] ignoring invalid env entry: {item!r}", flush=True)
+            continue
+        if pattern.lower() in seen:
+            continue
+        seen.add(pattern.lower())
+        rules.append({"pattern": pattern, "target": target})
+    return rules
+
+bypass_settings = {"priorities": _parse_bypass_priorities(os.environ.get("BYPASS_PRIORITIES", ""))}
+_bypass_settings_lock = threading.Lock()
+
+def _validate_bypass_priorities(data):
+    if not isinstance(data, dict) or not isinstance(data.get("priorities"), list):
+        return False, "body must be {priorities: [{pattern, target}]}"
+    rules = data["priorities"]
+    if len(rules) > _MAX_BYPASS_PRIORITIES:
+        return False, f"too many rules (max {_MAX_BYPASS_PRIORITIES})"
+    cleaned, seen = [], set()
+    for i, r in enumerate(rules):
+        if not isinstance(r, dict):
+            return False, f"rule #{i+1} must be an object"
+        pattern = str(r.get("pattern", "")).strip()
+        target = str(r.get("target", "")).strip().lower()
+        if not pattern:
+            return False, f"rule #{i+1} has an empty pattern"
+        if len(pattern) > 200:
+            return False, f"rule #{i+1} pattern is too long (max 200 chars)"
+        if target not in BYPASS_PRIORITY_TARGETS:
+            return False, f"rule #{i+1} has invalid target — use: {', '.join(BYPASS_PRIORITY_TARGETS)}"
+        if pattern.lower() in seen:
+            return False, f"duplicate pattern: {pattern!r}"
+        seen.add(pattern.lower())
+        cleaned.append({"pattern": pattern, "target": target})
+    data["priorities"] = cleaned
+    return True, None
+
+def _save_bypass_settings():
+    try:
+        tmp = BYPASS_SETTINGS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"priorities": bypass_settings["priorities"]}, f)
+        os.replace(tmp, BYPASS_SETTINGS_FILE)
+    except Exception as e:
+        print(f"[Priorities] save failed: {e}", flush=True)
+
+def _load_bypass_settings():
+    try:
+        with open(BYPASS_SETTINGS_FILE) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        print(f"[Priorities] load failed ({e}); using env bootstrap", flush=True)
+        return
+    ok, err = _validate_bypass_priorities(data)
+    if not ok:
+        print(f"[Priorities] settings file invalid ({err}); using env bootstrap", flush=True)
+        return
+    with _bypass_settings_lock:
+        bypass_settings["priorities"] = data["priorities"]
+
+_load_bypass_settings()
+
+def _match_bypass_priority(link):
+    """First rule whose pattern appears in the link (case-insensitive)."""
+    lowered = link.lower()
+    with _bypass_settings_lock:
+        rules = list(bypass_settings["priorities"])
+    for rule in rules:
+        if rule["pattern"].lower() in lowered:
+            return rule
+    return None
+
+def _bypass_priorities_snapshot():
+    with _bypass_settings_lock:
+        rules = [dict(r) for r in bypass_settings["priorities"]]
+    return {"success": True, "priorities": rules,
+            "_meta": {"targets": list(BYPASS_PRIORITY_TARGETS)}}
+
+def _run_bypass_priority(rule, link):
+    """Run a matched priority rule STRICTLY. Returns (winner|None, error|None).
+
+    dzhq/nick targets are NOT run here — the caller restricts the normal
+    Telegram flow to that single bot via its use_dzhq/use_nick flags.
+    """
+    target = rule["target"]
+    if target == "alex_api":
+        if not ALEX_BYPASS_API:
+            return None, "Alex API is not configured"
+        res, err = alex_bypass(link)
+        if res:
+            return {"source": "alex", "url": res["bypassed"],
+                    "extra": {"module": res.get("raw_type", "alex_api"),
+                             "account": "alex_api"}}, None
+        return None, err
+    if target == "alex_bot":
+        if not bot_settings.get("alex_bot", True):
+            return None, "Alex DM bot is disabled — enable it in /admin"
+        r, err = _alex_bot_roundtrip(link)
+        if r:
+            return {"source": "alex_bot", "url": r["bypassed"],
+                    "extra": {"module": "alex_bot", "account": r["account"]}}, None
+        return None, err or "Alex bot gave no result"
+    if target == "alex_race":
+        return alex_race(link)
+    return None, f"unsupported priority target: {target}"
+
 # Async requests are kept separate from the synchronous /bypass endpoint.  This
 # prevents a slow resolver (especially a Telegram bot) from making the caller's
 # HTTP request time out before the final Telegram message arrives.
@@ -1880,6 +2009,97 @@ def get_next_osint_active():
 
 
 # ==================== ALEX API + ALEX BOT RACE ====================
+def _alex_race_budget():
+    """Absolute safety cap for Alex resolutions (race and single-bot runs)."""
+    configured = [
+        value
+        for value in (ALEX_TIMEOUT_SEC, ALEX_BOT_TIMEOUT_SEC, BYPASS_IDLE_TIMEOUT_SEC)
+        if value > 0
+    ]
+    return min(
+        ALEX_RACE_MAX_TIMEOUT_SEC,
+        max(configured, default=30.0) + 5.0,
+    )
+
+
+def _alex_bot_roundtrip(link, stop_event=None, acc=None):
+    """One @alexbypassbot DM round-trip: send the link, wait for the reply.
+
+    Shared by the Alex race and bypass priority rules, so both use the exact
+    same send/wait/cleanup logic. Returns (result_dict|None, error_str|None);
+    (None, None) means stop_event was set — someone else already won.
+    """
+    if acc is None:
+        acc_id, acc_state = get_next_active()
+    else:
+        acc_id, acc_state = acc
+    if not acc_state:
+        return None, "No active Telegram account for Alex bot"
+    req_id = secrets.token_hex(8)
+    req_entry = {
+        "link":            link,
+        "ts":              time.time(),
+        "done":            False,
+        "alex_sent_id":    None,
+        "last_alex_ts":    None,
+        "alex_bot_event":  threading.Event(),
+        "alex_bot_result": None,
+    }
+    with accounts_lock:
+        accounts[acc_id]["pending"][req_id] = req_entry
+        alk = accounts[acc_id].get("alex_dm_lock")
+        if alk:
+            with alk:
+                accounts[acc_id]["alex_dm_queue"].append(req_id)
+    loop = acc_state.get("loop")
+
+    async def _send_alex():
+        sent = await acc_state["client"].send_message(ALEX_BOT, link)
+        req_entry["alex_sent_id"] = getattr(sent, "id", None)
+        req_entry["last_alex_ts"] = time.time()
+
+    try:
+        try:
+            asyncio.run_coroutine_threadsafe(_send_alex(), loop).result(timeout=12)
+        except Exception as e:
+            return None, f"Alex bot send error: {e}"
+        ev = req_entry["alex_bot_event"]
+        budget_end = time.time() + _alex_race_budget()
+        while stop_event is None or not stop_event.is_set():
+            if time.time() >= budget_end:
+                return None, "Alex bot timed out"
+            idle_timeout = (
+                BYPASS_IDLE_TIMEOUT_SEC
+                if BYPASS_IDLE_TIMEOUT_SEC > 0
+                else ALEX_BOT_TIMEOUT_SEC
+            )
+            last_seen = req_entry.get("last_alex_ts") or time.time()
+            rem = None if idle_timeout <= 0 else last_seen + idle_timeout - time.time()
+            if rem is not None and rem <= 0:
+                return None, "Alex bot idle timeout (no new message)"
+            if ev.wait(timeout=0.3 if rem is None else min(0.3, rem)):
+                r = req_entry.get("alex_bot_result")
+                if r and r.get("bypassed"):
+                    return {
+                        "status": "ok",
+                        "original": link,
+                        "bypassed": r["bypassed"],
+                        "account": acc_state.get("name") or acc_id,
+                    }, None
+                return None, (r or {}).get("error") or "Alex bot no result"
+        return None, None  # stopped: someone else won the race
+    finally:
+        with accounts_lock:
+            if acc_id in accounts:
+                accounts[acc_id]["pending"].pop(req_id, None)
+                alk = accounts[acc_id].get("alex_dm_lock")
+                if alk:
+                    with alk:
+                        q = accounts[acc_id].get("alex_dm_queue", [])
+                        if req_id in q:
+                            q.remove(req_id)
+
+
 def alex_race(link):
     """
     Race the Alex HTTP API against @alexbypassbot (Telegram DM).
@@ -1946,65 +2166,23 @@ def alex_race(link):
         acc_id, acc_state = get_next_active()
         error_goal = int(use_api) + int(bool(acc_state))
         if acc_state:
-            req_id    = secrets.token_hex(8)
-            req_entry = {
-                "link":            link,
-                "ts":              time.time(),
-                "done":            False,
-                "alex_sent_id":    None,
-                "last_alex_ts":    None,
-                "alex_bot_event":  threading.Event(),
-                "alex_bot_result": None,
-            }
-            with accounts_lock:
-                accounts[acc_id]["pending"][req_id] = req_entry
-                alk = accounts[acc_id].get("alex_dm_lock")
-                if alk:
-                    with alk:
-                        accounts[acc_id]["alex_dm_queue"].append(req_id)
-
-            loop = acc_state.get("loop")
-
-            async def _send_alex():
-                sent = await acc_state["client"].send_message(ALEX_BOT, link)
-                req_entry["alex_sent_id"] = getattr(sent, "id", None)
-                req_entry["last_alex_ts"] = time.time()
-
             def _bot_racer():
-                try:
-                    asyncio.run_coroutine_threadsafe(_send_alex(), loop).result(timeout=12)
-                except Exception as e:
-                    _record_error("bot", f"Alex bot send error: {e}")
+                r, err = _alex_bot_roundtrip(link, stop_event=race_event,
+                                             acc=(acc_id, acc_state))
+                if race_event.is_set():
                     return
-                ev = req_entry["alex_bot_event"]
-                while not race_event.is_set():
-                    idle_timeout = (
-                        BYPASS_IDLE_TIMEOUT_SEC
-                        if BYPASS_IDLE_TIMEOUT_SEC > 0
-                        else ALEX_BOT_TIMEOUT_SEC
+                if r:
+                    _declare(
+                        "alex_bot",
+                        r["bypassed"],
+                        {
+                            "module": "alex_bot",
+                            "account": r["account"],
+                        },
                     )
-                    last_seen = req_entry.get("last_alex_ts") or time.time()
-                    rem = None if idle_timeout <= 0 else last_seen + idle_timeout - time.time()
-                    if rem is not None and rem <= 0:
-                        _record_error("bot", "Alex bot idle timeout (no new message)")
-                        break
-                    if ev.wait(timeout=0.3 if rem is None else min(0.3, rem)):
-                        r = req_entry.get("alex_bot_result")
-                        if r and r.get("bypassed"):
-                            _declare(
-                                "alex_bot",
-                                r["bypassed"],
-                                {
-                                    "module": "alex_bot",
-                                    "account": acc_state.get("name") or acc_id,
-                                },
-                            )
-                        else:
-                            _record_error(
-                                "bot",
-                                (r or {}).get("error") or "Alex bot no result",
-                            )
-                        break
+                elif err:
+                    _record_error("bot", err)
+                # err None + no result = stopped after someone else won → silent
 
             threads.append(threading.Thread(target=_bot_racer, daemon=True))
         else:
@@ -2025,15 +2203,7 @@ def alex_race(link):
 
     # Racers use idle deadlines, but the caller still needs an absolute safety
     # cap if a worker crashes before it records an error.
-    configured = [
-        value
-        for value in (ALEX_TIMEOUT_SEC, ALEX_BOT_TIMEOUT_SEC, BYPASS_IDLE_TIMEOUT_SEC)
-        if value > 0
-    ]
-    race_budget = min(
-        ALEX_RACE_MAX_TIMEOUT_SEC,
-        max(configured, default=30.0) + 5.0,
-    )
+    race_budget = _alex_race_budget()
     if not race_event.wait(timeout=race_budget):
         race_event.set()
         with errors_lock:
@@ -2382,6 +2552,24 @@ ADMIN_HTML = r"""<!DOCTYPE html>
       </div>
 
 
+        <!-- Bypass Priorities Card -->
+        <div class="glass" style="padding:1.5rem;grid-column:1/-1;">
+          <div style="display:flex;align-items:center;gap:.875rem;margin-bottom:1rem;">
+            <div style="width:44px;height:44px;border-radius:.75rem;background:rgba(56,189,248,.12);border:1px solid rgba(56,189,248,.3);display:flex;align-items:center;justify-content:center;font-size:1.25rem;">🎯</div>
+            <div>
+              <div style="font-weight:700;font-size:.95rem;">Bypass Priorities</div>
+              <div class="text-xs text-muted text-mono">pattern → fixed resolver · first match wins · strict (no fallback to other bots)</div>
+            </div>
+          </div>
+          <div class="text-xs text-muted text-mono" style="margin-bottom:.75rem;">EXAMPLE: TIPSGURU.IN → BOT ONLY SENDS EVERY TIPSGURU LINK TO @ALEXBYPASSBOT</div>
+          <div id="prioList"></div>
+          <div style="display:flex;gap:.5rem;margin-top:.75rem;flex-wrap:wrap;">
+            <button class="btn btn-green" onclick="addPriorityRow()">＋ Add rule</button>
+            <button class="btn btn-green" onclick="savePriorities()">💾 Save priorities</button>
+            <button class="btn btn-amber" onclick="resetPriorities()">↺ Reset to env</button>
+          </div>
+        </div>
+
         <!-- DZHQ First Card -->
         <div class="glass" style="padding:1.5rem;grid-column:1/-1;">
           <div style="display:flex;align-items:center;gap:.875rem;margin-bottom:1rem;">
@@ -2610,6 +2798,7 @@ function showApp() {
   startRefresh();
   loadBotsStatus();
   loadOsintSettings();
+  loadPriorities();
 }
 
 function logout() {
@@ -2846,6 +3035,74 @@ async function setAlexRoute(route) {
     _applyBotState(d);
     toast(`Alex route → ${route}`, 'success');
   } catch(e) { toast(e.message, 'error'); loadBotsStatus(); }
+}
+
+let prioRules = [];
+let prioTargets = ['dzhq', 'nick', 'alex_bot', 'alex_api', 'alex_race'];
+async function loadPriorities() {
+  try {
+    const d = await apiCall('GET', '/admin/api/bypass/priorities');
+    if (!d.success) return;
+    prioRules = d.priorities || [];
+    if (d._meta && d._meta.targets) prioTargets = d._meta.targets;
+    renderPriorities();
+  } catch(e) {}
+}
+function renderPriorities() {
+  const box = document.getElementById('prioList');
+  if (!box) return;
+  const targetLabel = {dzhq: 'DZHQ group only', nick: 'Nick DM only', alex_bot: '@alexbypassbot only', alex_api: 'Alex API only', alex_race: 'Alex race (API + bot)'};
+  box.innerHTML = prioRules.map((r, i) => `
+    <div class="field-row" data-prio-row="${i}" style="margin-bottom:.5rem;align-items:end;">
+      <div class="field" style="margin-bottom:0;flex:2;"><label>Link pattern (matches inside URL)</label>
+        <input type="text" data-prio-pattern value="${esc(r.pattern || '')}" placeholder="e.g. tipsguru.in">
+      </div>
+      <div class="field" style="margin-bottom:0;flex:1;"><label>Resolver</label>
+        <select data-prio-target style="width:100%;padding:.625rem .75rem;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.12);border-radius:.5rem;color:var(--text);font-size:.82rem;">
+          ${prioTargets.map(t => `<option value="${t}"${t === r.target ? ' selected' : ''}>${targetLabel[t] || t}</option>`).join('')}
+        </select>
+      </div>
+      <div class="field" style="margin-bottom:0;flex:0;"><label>&nbsp;</label>
+        <button class="btn btn-amber" onclick="removePriorityRow(${i})">✕</button>
+      </div>
+    </div>`).join('') || '<div class="empty-state">No priority rules — every link uses the default flow</div>';
+}
+function readPriorityRows() {
+  return [...document.querySelectorAll('#prioList [data-prio-row]')].map(row => ({
+    pattern: row.querySelector('[data-prio-pattern]').value.trim(),
+    target: row.querySelector('[data-prio-target]').value
+  }));
+}
+function addPriorityRow() {
+  prioRules = readPriorityRows();
+  prioRules.push({pattern: '', target: 'alex_bot'});
+  renderPriorities();
+  const inputs = document.querySelectorAll('#prioList [data-prio-pattern]');
+  if (inputs.length) inputs[inputs.length - 1].focus();
+}
+function removePriorityRow(i) {
+  prioRules = readPriorityRows();
+  prioRules.splice(i, 1);
+  renderPriorities();
+}
+async function savePriorities() {
+  try {
+    const d = await apiCall('POST', '/admin/api/bypass/priorities', {priorities: readPriorityRows().filter(r => r.pattern !== '')});
+    if (!d.success) { toast(d.error || 'Invalid rules', 'error'); return; }
+    prioRules = d.priorities || [];
+    if (d._meta && d._meta.targets) prioTargets = d._meta.targets;
+    renderPriorities();
+    toast('Priorities saved', 'success');
+  } catch(e) { toast(e.message, 'error'); }
+}
+async function resetPriorities() {
+  try {
+    const d = await apiCall('POST', '/admin/api/bypass/priorities/reset', {});
+    if (!d.success) { toast(d.error || 'Reset failed', 'error'); return; }
+    prioRules = d.priorities || [];
+    renderPriorities();
+    toast('Priorities reset to env', 'success');
+  } catch(e) { toast(e.message, 'error'); }
 }
 
 let osintCfg = null;
@@ -3155,6 +3412,31 @@ def admin_bots_alex_route():
     bot_settings["alex_route"] = route
     return jsonify(_bots_state({"success": True, "route": route}))
 
+@app.route('/admin/api/bypass/priorities', methods=['GET'])
+@require_auth
+def admin_bypass_priorities():
+    return jsonify(_bypass_priorities_snapshot())
+
+@app.route('/admin/api/bypass/priorities', methods=['POST'])
+@require_auth
+def admin_bypass_priorities_save():
+    d = request.get_json(silent=True) or {}
+    ok, err = _validate_bypass_priorities(d)
+    if not ok:
+        return jsonify({"success": False, "error": err}), 400
+    with _bypass_settings_lock:
+        bypass_settings["priorities"] = d["priorities"]
+    _save_bypass_settings()
+    return jsonify(_bypass_priorities_snapshot())
+
+@app.route('/admin/api/bypass/priorities/reset', methods=['POST'])
+@require_auth
+def admin_bypass_priorities_reset():
+    with _bypass_settings_lock:
+        bypass_settings["priorities"] = _parse_bypass_priorities(os.environ.get("BYPASS_PRIORITIES", ""))
+    _save_bypass_settings()
+    return jsonify(_bypass_priorities_snapshot())
+
 
 # ==================== ADMIN OSINT ROUTING API — ADDITIVE ONLY ====================
 @app.route('/admin/api/osint/settings', methods=['GET'])
@@ -3442,7 +3724,40 @@ def bypass(link_override=None):
     # If Alex is offline or returns an error, continue with the original
     # Telegram race instead of failing the request.
     t0 = time.time()
-    if _should_use_alex(link):
+
+    # ── Priority rules: pattern match → fixed resolver (STRICT) ─────────
+    # A matched rule owns the whole request: alex_* targets run here and
+    # return; dzhq/nick targets restrict the Telegram flow below. No silent
+    # fallback to other resolvers — failures name the rule.
+    prio_rule = _match_bypass_priority(link)
+    prio_target = prio_rule["target"] if prio_rule else None
+    if prio_rule:
+        _flow_update(job_id, "processing",
+                     f"Priority rule matched: {prio_rule['pattern']} → {prio_target}")
+        _trace("PRIO", f"matched pattern={prio_rule['pattern']!r} target={prio_target} link={link}")
+    if prio_target in ("alex_api", "alex_bot", "alex_race"):
+        prio_winner, prio_error = _run_bypass_priority(prio_rule, link)
+        if prio_winner:
+            result_url = prio_winner["url"]
+            extra = prio_winner.get("extra", {})
+            _flow_update(job_id, "success", "Bypass successful",
+                         source=prio_winner["source"], url=result_url)
+            return jsonify(_single_bypass_payload(
+                original=link,
+                bypassed=result_url,
+                source=prio_winner["source"],
+                response_ms=f"{int((time.time() - t0) * 1000)}ms",
+                account=extra.get("account", prio_winner["source"]),
+                module=extra.get("module", prio_winner["source"]),
+            ))
+        _flow_update(job_id, "failed", f"Priority rule failed: {prio_error}")
+        return jsonify({
+            "status":    False,
+            "developer": DEVELOPER,
+            "message":   f"Priority {prio_rule['pattern']} → {prio_target} failed: {prio_error}",
+        }), 502
+
+    if prio_target not in ("dzhq", "nick") and _should_use_alex(link):
         _flow_update(job_id, "processing", "Checking Alex resolver")
         alex_winner, alex_error = alex_race(link)
         if alex_winner:
@@ -3477,6 +3792,14 @@ def bypass(link_override=None):
     # ── Respect bot toggles ───────────────────────────────────────────
     use_dzhq    = bot_settings.get("dzhq", True)
     use_nick    = bot_settings.get("nick", True)
+
+    # ── Priority restriction: an explicit rule beats the global toggles ─
+    if prio_target == "dzhq":
+        use_dzhq, use_nick = True, False
+        _trace("PRIO", f"restricted to DZHQ only for {link}")
+    elif prio_target == "nick":
+        use_dzhq, use_nick = False, True
+        _trace("PRIO", f"restricted to Nick only for {link}")
 
     # ── Mode resolution: primary bot runs first, other one is fallback ──
     primary = None
