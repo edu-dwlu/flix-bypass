@@ -698,6 +698,22 @@ def _run_bypass_priority(rule, link):
         return alex_race(link)
     return None, f"unsupported priority target: {target}"
 
+# Public aliases for priority targets — end users must never see internal
+# bot names or raw resolver dumps. Owners get the full error in server logs.
+BYPASS_TARGET_ALIASES = {
+    "dzhq":      "dz_q",
+    "nick":      "nk_b",
+    "alex_bot":  "ax_b",
+    "alex_api":  "ax_a",
+    "alex_race": "ax_r",
+}
+
+def _priority_public_message(rule):
+    """Short end-user message for a failed priority rule (no raw dumps)."""
+    alias = BYPASS_TARGET_ALIASES.get((rule or {}).get("target"), "srv")
+    return (f"{(rule or {}).get('pattern')} priority set bot i.e. {alias} "
+            f"failed — please try another link.")
+
 # Async requests are kept separate from the synchronous /bypass endpoint.  This
 # prevents a slow resolver (especially a Telegram bot) from making the caller's
 # HTTP request time out before the final Telegram message arrives.
@@ -3736,7 +3752,11 @@ def bypass(link_override=None):
                      f"Priority rule matched: {prio_rule['pattern']} → {prio_target}")
         _trace("PRIO", f"matched pattern={prio_rule['pattern']!r} target={prio_target} link={link}")
     if prio_target in ("alex_api", "alex_bot", "alex_race"):
-        prio_winner, prio_error = _run_bypass_priority(prio_rule, link)
+        try:
+            prio_winner, prio_error = _run_bypass_priority(prio_rule, link)
+        except Exception as exc:
+            logging.exception("Priority resolver crashed")
+            prio_winner, prio_error = None, f"resolver crashed: {exc}"
         if prio_winner:
             result_url = prio_winner["url"]
             extra = prio_winner.get("extra", {})
@@ -3750,11 +3770,17 @@ def bypass(link_override=None):
                 account=extra.get("account", prio_winner["source"]),
                 module=extra.get("module", prio_winner["source"]),
             ))
-        _flow_update(job_id, "failed", f"Priority rule failed: {prio_error}")
+        # Masked edge: users get ONLY the short aliased message. The full
+        # resolver dump stays in server logs for the owner — never in the
+        # API response (message, flow, or result).
+        public_msg = _priority_public_message(prio_rule)
+        print(f"[Prio] rule {prio_rule['pattern']!r} → {prio_target} failed: {prio_error}", flush=True)
+        _trace("PRIO", f"rule failed pattern={prio_rule['pattern']!r} target={prio_target} error={str(prio_error)[:300]}")
+        _flow_update(job_id, "failed", public_msg)
         return jsonify({
             "status":    False,
             "developer": DEVELOPER,
-            "message":   f"Priority {prio_rule['pattern']} → {prio_target} failed: {prio_error}",
+            "message":   public_msg,
         }), 502
 
     if prio_target not in ("dzhq", "nick") and _should_use_alex(link):
