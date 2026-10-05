@@ -112,7 +112,10 @@ ALEX_BYPASS_API = os.environ.get(
 ).strip()
 ALEX_TIMEOUT_SEC = float(os.environ.get("ALEX_TIMEOUT_SEC", "20"))
 ALEX_ALLOWED_HOST_PARTS = ("urlking", "monteolympus")
-ALEX_BOT_TIMEOUT_SEC = float(os.environ.get("ALEX_BOT_TIMEOUT_SEC", "75"))
+# @alexbypassbot can take 150s+ on slow links (tipsguru). This default must
+# stay above its worst real latency + margin; the shared absolute budget is
+# min(ALEX_RACE_MAX_TIMEOUT_SEC, max(...configured...) + 5).
+ALEX_BOT_TIMEOUT_SEC = float(os.environ.get("ALEX_BOT_TIMEOUT_SEC", "180"))
 # Alex route toggle — alex branch ONLY (DZHQ/Nick never reach the Alex code).
 # race = API + @alexbypassbot compete (default) · bot = bot only, skip the API
 # api = Alex HTTP API only, no Telegram DM is sent.
@@ -124,7 +127,7 @@ BYPASS_IDLE_TIMEOUT_SEC = float(os.environ.get("BYPASS_IDLE_TIMEOUT_SEC", "30"))
 # A non-positive per-bot timeout must never turn an HTTP request into an
 # unbounded wait. These caps are only used when a bot/API does not answer.
 ALEX_RACE_MAX_TIMEOUT_SEC = max(
-    30.0, float(os.environ.get("ALEX_RACE_MAX_TIMEOUT_SEC", "90"))
+    30.0, float(os.environ.get("ALEX_RACE_MAX_TIMEOUT_SEC", "210"))
 )
 MAX_BYPASS_TIMEOUT_SEC = max(
     30.0, float(os.environ.get("MAX_BYPASS_TIMEOUT_SEC", "120"))
