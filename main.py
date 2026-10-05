@@ -124,6 +124,11 @@ if ALEX_ROUTE not in ("race", "bot", "api"):
     ALEX_ROUTE = "race"
 # Only silence triggers this timeout. Progress/loading messages refresh it.
 BYPASS_IDLE_TIMEOUT_SEC = float(os.environ.get("BYPASS_IDLE_TIMEOUT_SEC", "30"))
+# Post-contact patience for @alexbypassbot: once it has sent at least one
+# message, long silent "cracking" phases are normal — allow this much quiet
+# before giving up. Before first contact the strict BYPASS_IDLE_TIMEOUT_SEC
+# still applies so dead bots fail fast. DZHQ/Nick never use this value.
+ALEX_BOT_IDLE_TIMEOUT_SEC = float(os.environ.get("ALEX_BOT_IDLE_TIMEOUT_SEC", "120"))
 # A non-positive per-bot timeout must never turn an HTTP request into an
 # unbounded wait. These caps are only used when a bot/API does not answer.
 ALEX_RACE_MAX_TIMEOUT_SEC = max(
@@ -1814,6 +1819,8 @@ def make_alex_dm_handler(acc_id):
             return
         _trace("ALEX_BOT", f"received for {req['link']}: text={text[:500]!r} parsed={r}")
         req["last_alex_ts"] = time.time()
+        if not req.get("alex_first_msg_ts"):
+            req["alex_first_msg_ts"] = req["last_alex_ts"]
         if r is None:
             folded_text = _fold(text)
             is_known_failure = _RX_ERR.search(folded_text) and not _RX_ALEX_BYPASSED.search(folded_text)
@@ -2032,13 +2039,28 @@ def _alex_race_budget():
     """Absolute safety cap for Alex resolutions (race and single-bot runs)."""
     configured = [
         value
-        for value in (ALEX_TIMEOUT_SEC, ALEX_BOT_TIMEOUT_SEC, BYPASS_IDLE_TIMEOUT_SEC)
+        for value in (ALEX_TIMEOUT_SEC, ALEX_BOT_TIMEOUT_SEC, BYPASS_IDLE_TIMEOUT_SEC,
+                      ALEX_BOT_IDLE_TIMEOUT_SEC)
         if value > 0
     ]
     return min(
         ALEX_RACE_MAX_TIMEOUT_SEC,
         max(configured, default=30.0) + 5.0,
     )
+
+
+def _alex_idle_timeout(req_entry):
+    """Effective idle allowance for the Alex bot wait loop.
+
+    Patient (ALEX_BOT_IDLE_TIMEOUT_SEC) once the bot has shown signs of
+    life; strict (BYPASS_IDLE_TIMEOUT_SEC chain) before first contact so a
+    dead bot still fails fast.
+    """
+    if req_entry.get("alex_first_msg_ts") and ALEX_BOT_IDLE_TIMEOUT_SEC > 0:
+        return ALEX_BOT_IDLE_TIMEOUT_SEC
+    if BYPASS_IDLE_TIMEOUT_SEC > 0:
+        return BYPASS_IDLE_TIMEOUT_SEC
+    return ALEX_BOT_TIMEOUT_SEC
 
 
 def _alex_bot_roundtrip(link, stop_event=None, acc=None):
@@ -2087,11 +2109,7 @@ def _alex_bot_roundtrip(link, stop_event=None, acc=None):
         while stop_event is None or not stop_event.is_set():
             if time.time() >= budget_end:
                 return None, "Alex bot timed out"
-            idle_timeout = (
-                BYPASS_IDLE_TIMEOUT_SEC
-                if BYPASS_IDLE_TIMEOUT_SEC > 0
-                else ALEX_BOT_TIMEOUT_SEC
-            )
+            idle_timeout = _alex_idle_timeout(req_entry)
             last_seen = req_entry.get("last_alex_ts") or time.time()
             rem = None if idle_timeout <= 0 else last_seen + idle_timeout - time.time()
             if rem is not None and rem <= 0:
