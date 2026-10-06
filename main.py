@@ -97,6 +97,10 @@ NICK_BOT        = "@Nick_Bypass_Bot"
 ALEX_BOT        = "@alexbypassbot"
 
 DEVELOPER       = "Mrr Unknown"
+# Build tag — bump on every behavior change so Render logs prove which copy
+# is actually live (error texts alone cannot distinguish versions).
+FELIX_BUILD = "2026-10-06 prio-mask + bot185 + idle2phase"
+print(f"[Felix] build {FELIX_BUILD}", flush=True)
 PORT            = int(os.environ.get('PORT', 5000))
 SECRET_KEY      = (
     os.environ.get("SECRET_KEY")
@@ -2105,7 +2109,8 @@ def _alex_bot_roundtrip(link, stop_event=None, acc=None):
         except Exception as e:
             return None, f"Alex bot send error: {e}"
         ev = req_entry["alex_bot_event"]
-        budget_end = time.time() + _alex_race_budget()
+        t_start = time.time()
+        budget_end = t_start + _alex_race_budget()
         while stop_event is None or not stop_event.is_set():
             if time.time() >= budget_end:
                 return None, "Alex bot timed out"
@@ -2113,6 +2118,11 @@ def _alex_bot_roundtrip(link, stop_event=None, acc=None):
             last_seen = req_entry.get("last_alex_ts") or time.time()
             rem = None if idle_timeout <= 0 else last_seen + idle_timeout - time.time()
             if rem is not None and rem <= 0:
+                now = time.time()
+                phase = "post-contact" if req_entry.get("alex_first_msg_ts") else "pre-contact"
+                print(f"[AlexBot] idle timeout after {now - t_start:.0f}s "
+                      f"({phase}, allowance={idle_timeout:.0f}s, "
+                      f"last_msg {now - last_seen:.0f}s ago)", flush=True)
                 return None, "Alex bot idle timeout (no new message)"
             if ev.wait(timeout=0.3 if rem is None else min(0.3, rem)):
                 r = req_entry.get("alex_bot_result")
