@@ -99,7 +99,7 @@ ALEX_BOT        = "@alexbypassbot"
 DEVELOPER       = "Mrr Unknown"
 # Build tag — bump on every behavior change so Render logs prove which copy
 # is actually live (error texts alone cannot distinguish versions).
-FELIX_BUILD = "2026-10-06 prio-mask + bot245 + idle3tier"
+FELIX_BUILD = "2026-10-06 dzhq260 + nodelete + poll330"
 print(f"[Felix] build {FELIX_BUILD}", flush=True)
 PORT            = int(os.environ.get('PORT', 5000))
 SECRET_KEY      = (
@@ -141,8 +141,14 @@ ALEX_RACE_MAX_TIMEOUT_SEC = max(
     30.0, float(os.environ.get("ALEX_RACE_MAX_TIMEOUT_SEC", "260"))
 )
 MAX_BYPASS_TIMEOUT_SEC = max(
-    30.0, float(os.environ.get("MAX_BYPASS_TIMEOUT_SEC", "120"))
+    30.0, float(os.environ.get("MAX_BYPASS_TIMEOUT_SEC", "300"))
 )
+# DZHQ group envelope: measured live 2026-10-06 (vplink median ~123s, max
+# ~214s). DZHQ gets up to this long; Nick keeps the fast BYPASS_IDLE base.
+DZHQ_TIMEOUT_SEC = float(os.environ.get("DZHQ_TIMEOUT_SEC", "260"))
+# Delete our own /b prompt from the DZHQ group when a request ends.
+# Default OFF (group keeps a visible trail); enable for tidy groups.
+DZHQ_DELETE_PROMPT = os.environ.get("DZHQ_DELETE_PROMPT", "0").lower() in ("1", "true", "yes", "on")
 
 # ===== FELIX OSINT ADDITIVE PATCH =====
 # OSINT bridge is intentionally separate from the existing bypass state.
@@ -548,7 +554,7 @@ def _trace(label, message):
 # Set to False to disable a bot entirely (it won't be sent to or waited on)
 bot_settings        = {"dzhq": True, "nick": True, "dzhq_first": False,
                        "nick_first": False, "random_mode": False, "alex_bot": True,
-                       "alex_route": ALEX_ROUTE}
+                       "alex_route": ALEX_ROUTE, "dzhq_delete": DZHQ_DELETE_PROMPT}
 
 # ── Random Mode state ──────────────────────────────────────────────────────────
 # Random Mode: ek bot par lagataar N requests (random 3-10), phir doosre bot par
@@ -2541,6 +2547,16 @@ ADMIN_HTML = r"""<!DOCTYPE html>
               <span class="toggle-slider"></span>
             </label>
           </div>
+          <div style="display:flex;align-items:center;justify-content:space-between;padding:.875rem 1rem;background:rgba(0,0,0,.25);border-radius:.625rem;border:1px solid rgba(255,255,255,.06);margin-top:.75rem;">
+            <div>
+              <div style="font-size:.82rem;font-weight:600;" id="dzhqDeleteLabel">Keep group messages</div>
+              <div class="text-xs text-muted text-mono">Delete our /b prompt after each request</div>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="dzhqDeleteToggle" onchange="toggleBot('dzhq_delete', this.checked)">
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
           <div style="margin-top:.875rem;font-size:.75rem;color:var(--muted);line-height:1.6;">
             Races in parallel with Nick. Whichever replies first wins. If disabled, only Nick runs.
           </div>
@@ -3010,6 +3026,10 @@ function _applyBotState(d) {
   updateAlexRouteDesc(d.alex_route || 'race', (d.alex_bot !== false));
 
   if (dLbl)  { dLbl.textContent  = d.dzhq       ? 'Enabled'               : 'Disabled'; dLbl.style.color  = d.dzhq       ? 'var(--green)' : 'var(--red)'; }
+  const ddEl  = document.getElementById('dzhqDeleteToggle');
+  const ddLbl = document.getElementById('dzhqDeleteLabel');
+  if (ddEl) ddEl.checked = !!d.dzhq_delete;
+  if (ddLbl) { const on = !!d.dzhq_delete; ddLbl.textContent = on ? 'Delete group messages' : 'Keep group messages'; ddLbl.style.color = on ? 'var(--amber)' : 'var(--muted)'; }
   if (nLbl)  { nLbl.textContent  = d.nick       ? 'Enabled'               : 'Disabled'; nLbl.style.color  = d.nick       ? 'var(--green)' : 'var(--red)'; }
   if (dfLbl) { dfLbl.textContent = d.dzhq_first ? 'ON — DZHQ First Mode'  : 'Disabled (Parallel Race)'; dfLbl.style.color = d.dzhq_first ? 'var(--amber)' : 'var(--muted)'; }
 
@@ -3065,7 +3085,7 @@ async function toggleBot(bot, enabled) {
     const d = await apiCall('POST', '/admin/api/bots/toggle', {bot, enabled});
     if (!d.success) { toast(d.error || 'Cannot disable both bots', 'error'); loadBotsStatus(); return; }
     _applyBotState(d);
-    const labels = { dzhq: 'DZHQ', nick: 'Nick', dzhq_first: 'DZHQ First Mode', nick_first: 'Nick First Mode', random_mode: 'Random Mode', alex_bot: 'Alex DM Bot' };
+    const labels = { dzhq: 'DZHQ', nick: 'Nick', dzhq_first: 'DZHQ First Mode', nick_first: 'Nick First Mode', random_mode: 'Random Mode', alex_bot: 'Alex DM Bot', dzhq_delete: 'DZHQ Cleanup' };
     toast(`${labels[bot] || bot} ${enabled ? 'enabled' : 'disabled'}`, 'success');
   } catch(e) { toast(e.message, 'error'); loadBotsStatus(); }
 }
@@ -3414,6 +3434,7 @@ def _bots_state(extra=None):
         "random_mode": bot_settings.get("random_mode", False),
         "alex_bot":    bot_settings.get("alex_bot", True),
         "alex_route":  bot_settings.get("alex_route", "race"),
+        "dzhq_delete": bot_settings.get("dzhq_delete", False),
         "random":      _random_status(),
     }
     if extra:
@@ -3431,11 +3452,15 @@ def admin_bots_toggle():
     d = request.get_json(silent=True) or {}
     bot  = d.get("bot")
     enab = bool(d.get("enabled", True))
-    if bot not in ("dzhq", "nick", "dzhq_first", "nick_first", "random_mode", "alex_bot"):
+    if bot not in ("dzhq", "nick", "dzhq_first", "nick_first", "random_mode", "alex_bot", "dzhq_delete"):
         return jsonify({"success": False, "error": "Invalid bot name"}), 400
     # Alex bot toggle — independent of the DZHQ/Nick race
     if bot == "alex_bot":
         bot_settings["alex_bot"] = enab
+        return jsonify(_bots_state({"success": True, "bot": bot, "enabled": enab}))
+    # DZHQ prompt cleanup toggle — cosmetic only, never affects resolution
+    if bot == "dzhq_delete":
+        bot_settings["dzhq_delete"] = enab
         return jsonify(_bots_state({"success": True, "bot": bot, "enabled": enab}))
     # Mode toggles — only one mode can be active at a time
     if bot in ("dzhq_first", "nick_first", "random_mode"):
@@ -3569,7 +3594,8 @@ def _public_status():
                            "nick_first": bot_settings.get("nick_first", False),
                             "random_mode": bot_settings.get("random_mode", False),
                             "alex_bot": bot_settings.get("alex_bot", True),
-                            "alex_route": bot_settings.get("alex_route", "race")},
+                            "alex_route": bot_settings.get("alex_route", "race"),
+                            "dzhq_delete": bot_settings.get("dzhq_delete", False)},
         "accounts":       accs,
     }
 
@@ -3755,6 +3781,25 @@ def bypass_status(job_id):
     return jsonify(snapshot)
 
 
+def _bypass_request_budget(use_dzhq, use_nick, seq_mode):
+    """Wait envelope for a Telegram bypass request.
+
+    DZHQ gets its own slow envelope (DZHQ_TIMEOUT_SEC, measured live);
+    Nick keeps the fast BYPASS_IDLE_TIMEOUT_SEC base. Sequential modes sum
+    both stages; parallel takes the max. Identical to the old TIMEOUT math
+    whenever DZHQ is off.
+    """
+    dzhq_need = DZHQ_TIMEOUT_SEC if use_dzhq else 0
+    nick_need = BYPASS_IDLE_TIMEOUT_SEC if (use_nick and BYPASS_IDLE_TIMEOUT_SEC > 0) else 0
+    if seq_mode:
+        budget = dzhq_need + nick_need
+    else:
+        budget = max(dzhq_need, nick_need)
+    if budget <= 0:
+        budget = MAX_BYPASS_TIMEOUT_SEC
+    return min(MAX_BYPASS_TIMEOUT_SEC, max(1.0, budget))
+
+
 @app.route('/bypass', methods=['GET', 'POST'])
 def bypass(link_override=None):
     if request.method == 'GET':
@@ -3910,7 +3955,7 @@ def bypass(link_override=None):
                     accounts[acc_id]["nick_dm_queue"].append(req_id)
 
     TIMEOUT      = BYPASS_IDLE_TIMEOUT_SEC
-    DZHQ_TIMEOUT = 20.0   # How long to wait for DZHQ before falling back to Nick
+    DIDLE        = DZHQ_TIMEOUT_SEC  # DZHQ's own envelope (measured slow); Nick keeps TIMEOUT
 
     # ── Helper: send to Nick (used in both modes) ─────────────────────
     async def _send_nick(tg):
@@ -4011,26 +4056,21 @@ def bypass(link_override=None):
             if done_count[0] >= watcher_goal:
                 race_event.set()   # all active bots timed out / failed
 
-    request_budget = (
-        TIMEOUT * (2 if seq_mode else 1)
-        if TIMEOUT > 0
-        else MAX_BYPASS_TIMEOUT_SEC
-    )
-    request_budget = min(MAX_BYPASS_TIMEOUT_SEC, max(1.0, request_budget))
+    request_budget = _bypass_request_budget(use_dzhq, use_nick, seq_mode)
     request_deadline = time.monotonic() + request_budget
 
-    def _remaining(last_seen):
+    def _remaining(last_seen, idle_base=TIMEOUT):
         hard_remaining = request_deadline - time.monotonic()
-        if TIMEOUT <= 0:
+        if idle_base <= 0:
             return hard_remaining
-        idle_remaining = last_seen + TIMEOUT - time.time()
+        idle_remaining = last_seen + idle_base - time.time()
         return min(idle_remaining, hard_remaining)
 
     def _watch_dzhq():
         ev = req_entry['dzhq_event']
         while not race_event.is_set():
             last_seen = req_entry.get("last_dzhq_ts") or t0
-            remaining = _remaining(last_seen)
+            remaining = _remaining(last_seen, DIDLE)
             if remaining is not None and remaining <= 0: break
             if ev.wait(timeout=0.3 if remaining is None else min(0.3, remaining)):
                 res = req_entry.get('dzhq_result')
@@ -4092,7 +4132,7 @@ def bypass(link_override=None):
             dz_ev = req_entry['dzhq_event']
             while not race_event.is_set():
                 last_seen = req_entry.get("last_dzhq_ts") or time.time()
-                rem = _remaining(last_seen)
+                rem = _remaining(last_seen, DIDLE)
                 if rem is not None and rem <= 0: break
                 if dz_ev.wait(timeout=0.3 if rem is None else min(0.3, rem)):
                     res = req_entry.get('dzhq_result')
@@ -4115,8 +4155,11 @@ def bypass(link_override=None):
     # forever.
     race_event.wait(timeout=max(0.0, request_deadline - time.monotonic()))
 
-    # Cleanup
+    # Cleanup — our /b prompt is deleted ONLY when dzhq_delete is on
+    # (default off: the group keeps a visible trail of what was tried).
     async def _cleanup():
+        if not bot_settings.get("dzhq_delete", False):
+            return
         tg = acc_state["client"]
         for gid, key in ((DZHQ_GROUP, 'dzhq_sent_id'),):
             mid = req_entry.get(key)
