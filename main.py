@@ -99,7 +99,7 @@ ALEX_BOT        = "@alexbypassbot"
 DEVELOPER       = "Mrr Unknown"
 # Build tag — bump on every behavior change so Render logs prove which copy
 # is actually live (error texts alone cannot distinguish versions).
-FELIX_BUILD = "2026-10-06 prio-mask + bot185 + idle2phase"
+FELIX_BUILD = "2026-10-06 prio-mask + bot245 + idle3tier"
 print(f"[Felix] build {FELIX_BUILD}", flush=True)
 PORT            = int(os.environ.get('PORT', 5000))
 SECRET_KEY      = (
@@ -119,7 +119,7 @@ ALEX_ALLOWED_HOST_PARTS = ("urlking", "monteolympus")
 # @alexbypassbot can take 150s+ on slow links (tipsguru). This default must
 # stay above its worst real latency + margin; the shared absolute budget is
 # min(ALEX_RACE_MAX_TIMEOUT_SEC, max(...configured...) + 5).
-ALEX_BOT_TIMEOUT_SEC = float(os.environ.get("ALEX_BOT_TIMEOUT_SEC", "180"))
+ALEX_BOT_TIMEOUT_SEC = float(os.environ.get("ALEX_BOT_TIMEOUT_SEC", "240"))
 # Alex route toggle — alex branch ONLY (DZHQ/Nick never reach the Alex code).
 # race = API + @alexbypassbot compete (default) · bot = bot only, skip the API
 # api = Alex HTTP API only, no Telegram DM is sent.
@@ -130,13 +130,15 @@ if ALEX_ROUTE not in ("race", "bot", "api"):
 BYPASS_IDLE_TIMEOUT_SEC = float(os.environ.get("BYPASS_IDLE_TIMEOUT_SEC", "30"))
 # Post-contact patience for @alexbypassbot: once it has sent at least one
 # message, long silent "cracking" phases are normal — allow this much quiet
-# before giving up. Before first contact the strict BYPASS_IDLE_TIMEOUT_SEC
-# still applies so dead bots fail fast. DZHQ/Nick never use this value.
-ALEX_BOT_IDLE_TIMEOUT_SEC = float(os.environ.get("ALEX_BOT_IDLE_TIMEOUT_SEC", "120"))
+# before giving up. DZHQ/Nick never use this value.
+ALEX_BOT_IDLE_TIMEOUT_SEC = float(os.environ.get("ALEX_BOT_IDLE_TIMEOUT_SEC", "170"))
+# Pre-contact patience: the bot is sometimes slow to even react to a fresh
+# DM (>30s observed). Zero disables it back to the BYPASS_IDLE chain.
+ALEX_BOT_FIRST_TIMEOUT_SEC = float(os.environ.get("ALEX_BOT_FIRST_TIMEOUT_SEC", "60"))
 # A non-positive per-bot timeout must never turn an HTTP request into an
 # unbounded wait. These caps are only used when a bot/API does not answer.
 ALEX_RACE_MAX_TIMEOUT_SEC = max(
-    30.0, float(os.environ.get("ALEX_RACE_MAX_TIMEOUT_SEC", "210"))
+    30.0, float(os.environ.get("ALEX_RACE_MAX_TIMEOUT_SEC", "260"))
 )
 MAX_BYPASS_TIMEOUT_SEC = max(
     30.0, float(os.environ.get("MAX_BYPASS_TIMEOUT_SEC", "120"))
@@ -2044,7 +2046,7 @@ def _alex_race_budget():
     configured = [
         value
         for value in (ALEX_TIMEOUT_SEC, ALEX_BOT_TIMEOUT_SEC, BYPASS_IDLE_TIMEOUT_SEC,
-                      ALEX_BOT_IDLE_TIMEOUT_SEC)
+                      ALEX_BOT_IDLE_TIMEOUT_SEC, ALEX_BOT_FIRST_TIMEOUT_SEC)
         if value > 0
     ]
     return min(
@@ -2056,12 +2058,16 @@ def _alex_race_budget():
 def _alex_idle_timeout(req_entry):
     """Effective idle allowance for the Alex bot wait loop.
 
-    Patient (ALEX_BOT_IDLE_TIMEOUT_SEC) once the bot has shown signs of
-    life; strict (BYPASS_IDLE_TIMEOUT_SEC chain) before first contact so a
-    dead bot still fails fast.
+    Post-contact: patient (ALEX_BOT_IDLE_TIMEOUT_SEC) — long silent
+    cracking phases are normal. Pre-contact: ALEX_BOT_FIRST_TIMEOUT_SEC
+    (slow starts tolerated, 0 disables to the BYPASS_IDLE chain) so a dead
+    bot still fails fast. Absolute budget always caps everything.
     """
-    if req_entry.get("alex_first_msg_ts") and ALEX_BOT_IDLE_TIMEOUT_SEC > 0:
-        return ALEX_BOT_IDLE_TIMEOUT_SEC
+    if req_entry.get("alex_first_msg_ts"):
+        if ALEX_BOT_IDLE_TIMEOUT_SEC > 0:
+            return ALEX_BOT_IDLE_TIMEOUT_SEC
+    elif ALEX_BOT_FIRST_TIMEOUT_SEC > 0:
+        return ALEX_BOT_FIRST_TIMEOUT_SEC
     if BYPASS_IDLE_TIMEOUT_SEC > 0:
         return BYPASS_IDLE_TIMEOUT_SEC
     return ALEX_BOT_TIMEOUT_SEC
