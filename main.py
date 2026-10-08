@@ -99,7 +99,7 @@ ALEX_BOT        = "@alexbypassbot"
 DEVELOPER       = "Mrr Unknown"
 # Build tag — bump on every behavior change so Render logs prove which copy
 # is actually live (error texts alone cannot distinguish versions).
-FELIX_BUILD = "2026-10-06 dzhq260 + nodelete + poll330"
+FELIX_BUILD = "2026-10-06 bot345 + idle280 + poll380"
 print(f"[Felix] build {FELIX_BUILD}", flush=True)
 PORT            = int(os.environ.get('PORT', 5000))
 SECRET_KEY      = (
@@ -119,7 +119,7 @@ ALEX_ALLOWED_HOST_PARTS = ("urlking", "monteolympus")
 # @alexbypassbot can take 150s+ on slow links (tipsguru). This default must
 # stay above its worst real latency + margin; the shared absolute budget is
 # min(ALEX_RACE_MAX_TIMEOUT_SEC, max(...configured...) + 5).
-ALEX_BOT_TIMEOUT_SEC = float(os.environ.get("ALEX_BOT_TIMEOUT_SEC", "240"))
+ALEX_BOT_TIMEOUT_SEC = float(os.environ.get("ALEX_BOT_TIMEOUT_SEC", "340"))
 # Alex route toggle — alex branch ONLY (DZHQ/Nick never reach the Alex code).
 # race = API + @alexbypassbot compete (default) · bot = bot only, skip the API
 # api = Alex HTTP API only, no Telegram DM is sent.
@@ -131,14 +131,14 @@ BYPASS_IDLE_TIMEOUT_SEC = float(os.environ.get("BYPASS_IDLE_TIMEOUT_SEC", "30"))
 # Post-contact patience for @alexbypassbot: once it has sent at least one
 # message, long silent "cracking" phases are normal — allow this much quiet
 # before giving up. DZHQ/Nick never use this value.
-ALEX_BOT_IDLE_TIMEOUT_SEC = float(os.environ.get("ALEX_BOT_IDLE_TIMEOUT_SEC", "170"))
+ALEX_BOT_IDLE_TIMEOUT_SEC = float(os.environ.get("ALEX_BOT_IDLE_TIMEOUT_SEC", "280"))
 # Pre-contact patience: the bot is sometimes slow to even react to a fresh
 # DM (>30s observed). Zero disables it back to the BYPASS_IDLE chain.
 ALEX_BOT_FIRST_TIMEOUT_SEC = float(os.environ.get("ALEX_BOT_FIRST_TIMEOUT_SEC", "60"))
 # A non-positive per-bot timeout must never turn an HTTP request into an
 # unbounded wait. These caps are only used when a bot/API does not answer.
 ALEX_RACE_MAX_TIMEOUT_SEC = max(
-    30.0, float(os.environ.get("ALEX_RACE_MAX_TIMEOUT_SEC", "260"))
+    30.0, float(os.environ.get("ALEX_RACE_MAX_TIMEOUT_SEC", "360"))
 )
 MAX_BYPASS_TIMEOUT_SEC = max(
     30.0, float(os.environ.get("MAX_BYPASS_TIMEOUT_SEC", "300"))
